@@ -10,12 +10,12 @@ import json
 from dataclasses import dataclass
 
 
-DEFAULT_TOTAL_BUDGET = 12000
+DEFAULT_TOTAL_BUDGET = 100000  # 100k 输入预算
 DEFAULT_SECTION_BUDGETS = {
-    "prefix": 3600,
-    "memory": 1600,
-    "relevant_memory": 1200,
-    "history": 5200,
+    "prefix": 8000,      # 系统提示词 + 工具定义
+    "memory": 4000,      # 工作记忆
+    "relevant_memory": 3000,  # 相关笔记
+    "history": 80000,    # 历史记录（主要瓶颈）
 }
 DEFAULT_SECTION_FLOORS = {
     "prefix": 1200,
