@@ -898,6 +898,8 @@ class Pico:
                 tool_steps += 1
                 name = payload.get("name", "")
                 args = payload.get("args", {})
+                # 打印工具调用信息到控制台
+                print(f"[Tool] {name}({json.dumps(args, ensure_ascii=False)})")
                 task_state.record_tool(name)
                 tool_started_at = time.monotonic()
                 result = self.run_tool(name, args)
