@@ -84,8 +84,10 @@ def validate_tool(agent, name, args):
 
     if name == "list_files":
         path = agent.path(args.get("path", "."))
+        if not path.exists():
+            raise FileNotFoundError(f"Path does not exist: {path}")#增加更准确的错误信息
         if not path.is_dir():
-            raise ValueError("path is not a directory")
+            raise ValueError(f"path is not a directory: {path}")
         return
 
     if name == "read_file":

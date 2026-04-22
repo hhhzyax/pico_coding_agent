@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "description": "Reading and comprehension benchmark tasks for Pico. Tests agent's ability to read files, find code implementations, and summarize folder contents.",
+  "tasks": [
+    {
+      "id": "read_single_file_summary",
+      "prompt": "读取 runtime_summary.py 文件，并总结其主要功能。要求输出包含：1. 文件的主要类；2. 核心方法及其作用；3. 整体架构设计。请使用结构化格式输出：\n{\n  \"files_read\": [\"runtime_summary.py\"],\n  \"main_classes\": [\"类名\"],\n  \"key_methods\": [{\"name\": \"方法名\", \"purpose\": \"作用\"}],\n  \"architecture_summary\": \"架构总结\"\n}",
+      "fixture_repo": "tests/fixtures/bench_repo_reading/case1_single_file",
+      "allowed_tools": ["read_file"],
+      "step_budget": 3,
+      "expected_artifact": "结构化总结输出",
+      "verifier": "python3 tests/fixtures/bench_repo_reading/verify_case1.py",
+      "category": "reading-comprehension"
+    },
+    {
+      "id": "find_and_explain_code",
+      "prompt": "在 delegate_tool.py 中找到父子 agent 的实现代码，并讲解其工作原理。要求输出包含：1. 核心函数名；2. 父子 agent 的交互流程；3. 深度限制机制。请使用结构化格式输出：\n{\n  \"files_read\": [\"delegate_tool.py\"],\n  \"core_function\": \"函数名\",\n  \"interaction_flow\": [\"步骤1\", \"步骤2\", ...],\n  \"depth_limit_mechanism\": \"机制说明\"\n}",
+      "fixture_repo": "tests/fixtures/bench_repo_reading/case2_find_code",
+      "allowed_tools": ["read_file", "search"],
+      "step_budget": 4,
+      "expected_artifact": "代码实现讲解",
+      "verifier": "python3 tests/fixtures/bench_repo_reading/verify_case2.py",
+      "category": "code-comprehension"
+    },
+    {
+      "id": "read_folder_summary",
+      "prompt": "读取 case3_folder 目录下的所有 Python 文件，并总结每个文件的功能。要求输出包含：1. 读取的所有文件列表；2. 每个文件的主要功能；3. 文件之间的关系。请使用结构化格式输出：\n{\n  \"files_read\": [\"file1.py\", \"file2.py\", ...],\n  \"file_summaries\": [{\"file\": \"文件名\", \"purpose\": \"功能\"}],\n  \"relationships\": \"文件关系说明\"\n}",
+      "fixture_repo": "tests/fixtures/bench_repo_reading/case3_folder",
+      "allowed_tools": ["list_files", "read_file"],
+      "step_budget": 8,
+      "expected_artifact": "文件夹内容总结",
+      "verifier": "python3 tests/fixtures/bench_repo_reading/verify_case3.py",
+      "category": "folder-comprehension"
+    }
+  ]
+}

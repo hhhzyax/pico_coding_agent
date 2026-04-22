@@ -518,6 +518,11 @@ class Pico:
         env["PWD"] = str(self.root)
         if "PATH" not in env and os.environ.get("PATH"):
             env["PATH"] = os.environ["PATH"]
+        # Windows 需要额外保留一些系统变量，否则子进程无法初始化
+        if os.name == 'nt':
+            for key in ['SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR']:
+                if key in os.environ and key not in env:
+                    env[key] = os.environ[key]
         return env
 
     def prompt_metadata(self, user_message, prompt):
