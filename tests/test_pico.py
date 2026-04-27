@@ -799,12 +799,24 @@ def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
 
 
 def test_trace_and_report_redact_secret_env_values(tmp_path):
+    import os
     secret = "sk-test-secret-123"
-    with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=True):
+    env_vars = {"OPENAI_API_KEY": secret}
+    # Windows 需要保留 ComSpec 和 SystemRoot 才能启动 shell
+    if os.name == 'nt':
+        for key in ['ComSpec', 'SystemRoot', 'PATH']:
+            if key in os.environ:
+                env_vars[key] = os.environ[key]
+    # Windows 没有 printf 命令，使用 echo 代替
+    if os.name == 'nt':
+        shell_cmd = "echo sk-test-secret-123"
+    else:
+        shell_cmd = "printf '%s' 'sk-test-secret-123'"
+    with patch.dict(os.environ, env_vars, clear=True):
         agent = build_agent(
             tmp_path,
             [
-                '<tool>{"name":"run_shell","args":{"command":"printf \'%s\' \'sk-test-secret-123\'","timeout":20}}</tool>',
+                f'<tool>{{"name":"run_shell","args":{{"command":"{shell_cmd}","timeout":20}}}}</tool>',
                 "<final>Masked.</final>",
             ],
         )

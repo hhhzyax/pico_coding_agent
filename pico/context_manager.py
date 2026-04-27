@@ -360,13 +360,20 @@ class ContextManager:
 
     def _compressed_history_entries(self, history, recent_start):
         entries = []
-        seen_older_reads = set()
         details = {
             "older_entries_count": 0,
             "collapsed_duplicate_reads": 0,
             "reused_file_summary_count": 0,
             "summarized_tool_count": 0,
         }
+
+        latest_older_read_file_index = {}
+        for index, item in enumerate(history):
+            recent = index >= recent_start
+            if not recent and item["role"] == "tool" and item["name"] == "read_file":
+                path = str(item["args"].get("path", "")).strip()
+                if path:
+                    latest_older_read_file_index[path] = index
 
         for index, item in enumerate(history):
             recent = index >= recent_start
@@ -382,10 +389,9 @@ class ContextManager:
 
             if item["role"] == "tool" and item["name"] == "read_file":
                 path = str(item["args"].get("path", "")).strip()
-                if path in seen_older_reads:
+                if path and index != latest_older_read_file_index.get(path):
                     details["collapsed_duplicate_reads"] += 1
                     continue
-                seen_older_reads.add(path)
                 summary = self._reusable_file_summary(path)
                 if summary:
                     entries.append({"recent": False, "lines": [f"{path} -> {summary}"]})

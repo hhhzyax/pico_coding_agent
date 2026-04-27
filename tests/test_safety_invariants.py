@@ -218,6 +218,19 @@ def test_delegate_child_is_read_only(tmp_path):
     assert "delegate_result" in tool_events[0]["content"]
 
 
+def test_list_files_rejects_nonexistent_path(tmp_path):
+    agent = build_agent(tmp_path, [])
+    result = agent.run_tool("list_files", {"path": "nonexistent_dir"})
+    assert "Path does not exist" in result
+
+
+def test_list_files_rejects_file_path(tmp_path):
+    agent = build_agent(tmp_path, [])
+    (tmp_path / "a_file.txt").write_text("content", encoding="utf-8")
+    result = agent.run_tool("list_files", {"path": "a_file.txt"})
+    assert "path is not a directory" in result
+
+
 def test_configured_secret_env_names_are_redacted_in_trace_and_report(tmp_path):
     github_pat = "ghp_configured_secret_123"
     gh_pat = "ghp_configured_secret_456"
