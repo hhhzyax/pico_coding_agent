@@ -176,14 +176,14 @@ def measure_feature_ablation_metrics(agent, user_message):
     results = {}
     for name, updates in variants.items():
         with _temporary_feature_flags(agent, updates):
-            prompt, metadata = agent._build_prompt_and_metadata(user_message)
+            system, messages, metadata = agent._build_prompt_and_metadata(user_message)
         results[name] = {
             "prompt_chars": int(metadata.get("prompt_chars", 0)),
             "memory_chars": int(metadata.get("sections", {}).get("memory", {}).get("rendered_chars", 0)),
             "history_chars": int(metadata.get("sections", {}).get("history", {}).get("rendered_chars", 0)),
             "relevant_selected_count": int(metadata.get("relevant_memory", {}).get("selected_count", 0)),
             "budget_reduction_count": len(metadata.get("budget_reductions", [])),
-            "current_request_preserved": prompt.endswith(f"Current user request:\n{user_message}"),
+            "current_request_preserved": bool(messages and messages[-1].get("content", "").endswith(user_message)),
         }
     return results
 

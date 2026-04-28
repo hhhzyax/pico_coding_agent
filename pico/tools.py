@@ -283,7 +283,7 @@ def tool_delegate(agent, args):
         secret_env_names=agent.secret_env_names,
         shell_env_allowlist=agent.shell_env_allowlist,
     )
-    # 委派的目标是“调查”，不是“放权执行”。
+    # 委派的目标是"调查"，不是"放权执行"。
     # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
     child.session["memory"]["task"] = task
     child.session["memory"]["notes"] = [clip(agent.history_text(), 300)]
@@ -298,3 +298,76 @@ _TOOL_RUNNERS = {
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,
 }
+
+
+def _param_to_json_schema(param_spec):
+    """将自定义 schema 格式转换为 JSON Schema 片段。
+
+    "str"       -> {"type": "string"}
+    "int=1"     -> {"type": "integer", "default": 1}
+    "str='.'"   -> {"type": "string", "default": "."}
+    """
+    param_spec = str(param_spec).strip()
+    if "=" in param_spec:
+        type_part, default_part = param_spec.split("=", 1)
+    else:
+        type_part = param_spec
+        default_part = None
+
+    type_part = type_part.strip()
+    type_map = {
+        "str": "string",
+        "int": "integer",
+        "float": "number",
+        "bool": "boolean",
+        "list": "array",
+    }
+    json_type = type_map.get(type_part, "string")
+    schema = {"type": json_type}
+
+    if default_part is not None:
+        default_str = default_part.strip().strip("'\"")
+        if json_type == "integer":
+            try:
+                schema["default"] = int(default_str)
+            except ValueError:
+                pass
+        elif json_type == "number":
+            try:
+                schema["default"] = float(default_str)
+            except ValueError:
+                pass
+        elif json_type == "boolean":
+            schema["default"] = default_str.lower() in ("true", "1", "yes")
+        else:
+            schema["default"] = default_str
+
+    return schema
+
+
+def _spec_to_tool_api(name, spec):
+    """将单个工具规格转为 Anthropic API 的 tool 格式。"""
+    properties = {}
+    required = []
+    for param_name, param_spec in spec["schema"].items():
+        json_schema = _param_to_json_schema(param_spec)
+        properties[param_name] = json_schema
+        if "default" not in json_schema:
+            required.append(param_name)
+    return {
+        "name": name,
+        "description": spec["description"],
+        "input_schema": {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+        },
+    }
+
+
+def get_tools_for_api(agent):
+    """获取所有工具的 Anthropic API JSON Schema 格式定义。"""
+    tools = [_spec_to_tool_api(name, spec) for name, spec in BASE_TOOL_SPECS.items()]
+    if agent.depth < agent.max_depth:
+        tools.append(_spec_to_tool_api("delegate", DELEGATE_TOOL_SPEC))
+    return tools

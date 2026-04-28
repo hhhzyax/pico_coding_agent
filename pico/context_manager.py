@@ -76,25 +76,12 @@ class ContextManager:
         self.reduction_order = tuple(reduction_order or DEFAULT_REDUCTION_ORDER)
 
     def build(self, user_message):
-        """按预算组装一轮完整 prompt。
+        """按预算组装一轮完整 prompt，返回原生 function calling 格式。
 
-        为什么存在：
-        仅靠用户这一轮输入，模型并不知道当前仓库状态、会话里已经读过什么、
-        哪些旧信息还值得继续参考。这个函数负责把“稳定基线 + 工作记忆 +
-        相关笔记 + 历史 + 当前请求”拼成真正发给模型的 prompt。
-
-        输入 / 输出：
-        - 输入：`user_message`，也就是用户当前这一轮的新请求。
-        - 输出：`(prompt, metadata)`。
-          `prompt` 是最终发送给模型的文本；
-          `metadata` 记录了每个 section 的原始长度、裁剪后的长度、是否触发了
-          预算收缩等信息，后续会进入 trace/report，便于解释这轮 prompt
-          是怎么被拼出来的。
-
-        在 agent 链路里的位置：
-        它位于 `Pico.ask()` 的每轮模型调用之前，是“真正发请求给模型”
-        的最后一道组装工序。`WorkspaceContext` 提供稳定前缀，`LayeredMemory`
-        提供工作记忆，这个函数则把它们和当前请求合成一份可控大小的 prompt。
+        返回 `(system, messages, metadata)`：
+        - system: 系统提示词（prefix + memory + relevant_memory）
+        - messages: 结构化历史消息 + 当前用户请求
+        - metadata: 各 section 的预算与裁剪信息
         """
         user_message = str(user_message)
         self.section_floors = self._compute_section_floors()
@@ -123,26 +110,13 @@ class ContextManager:
         if not context_reduction_enabled:
             rendered = self._render_sections_without_reduction(section_texts, selected_notes=selected_notes)
             prompt = self._assemble_prompt(rendered)
-            metadata = self._metadata(
-                prompt=prompt,
-                rendered=rendered,
-                budgets={section: render.budget for section, render in rendered.items() if section != CURRENT_REQUEST_SECTION},
-                reduction_log=[],
-                selected_notes=selected_notes,
-                user_message=user_message,
-                section_texts=section_texts,
-            )
-            return prompt, metadata
+            return self._build_native_result(prompt, rendered, user_message, section_texts, budgets={}, reduction_log=[], selected_notes=selected_notes)
 
         budgets = dict(self.section_budgets)
         rendered = self._render_sections(section_texts, budgets, selected_notes=selected_notes)
         prompt = self._assemble_prompt(rendered)
         reduction_log = []
 
-        # 如果 prompt 超预算，就按固定顺序不断压缩。
-        # 这里的顺序体现了平台偏好：
-        # 先牺牲 relevant_memory，再牺牲 history，然后才动 memory 和 prefix。
-        # 最新用户请求永远不裁剪，因为那是本轮最重要的输入。
         while len(prompt) > self.total_budget:
             overflow = len(prompt) - self.total_budget
             reduced = False
@@ -170,6 +144,9 @@ class ContextManager:
             if not reduced:
                 break
 
+        return self._build_native_result(prompt, rendered, user_message, section_texts, budgets=budgets, reduction_log=reduction_log, selected_notes=selected_notes)
+
+    def _build_native_result(self, prompt, rendered, user_message, section_texts, budgets, reduction_log, selected_notes):
         metadata = self._metadata(
             prompt=prompt,
             rendered=rendered,
@@ -179,7 +156,57 @@ class ContextManager:
             user_message=user_message,
             section_texts=section_texts,
         )
-        return prompt, metadata
+        system = "\n\n".join(
+            rendered[sec].rendered
+            for sec in ("prefix", "memory", "relevant_memory")
+            if rendered[sec].rendered.strip()
+        ).strip()
+        history_budget = rendered["history"].budget
+        messages = self._history_to_native_messages(history_budget)
+        messages.append({"role": "user", "content": user_message})
+        return system, messages, metadata
+
+    def _history_to_native_messages(self, history_budget=None):
+        history = self.agent.session.get("history", [])
+        recent_count = 12
+        recent_start = max(0, len(history) - recent_count)
+        messages = []
+        for index, item in enumerate(history):
+            recent = index >= recent_start
+            role = item.get("role", "")
+            content = item.get("content", "")
+            # 与 history_text() 保持一致：近期条目保留较长内容，旧条目截短
+            if history_budget is not None:
+                limit = 900 if recent else 220
+                if len(content) > limit:
+                    content = content[:limit - 3] + "..."
+            if role == "user":
+                messages.append({"role": "user", "content": content})
+            elif role == "assistant":
+                tool_use = item.get("tool_use")
+                if tool_use:
+                    messages.append({
+                        "role": "assistant",
+                        "content": content,
+                        "tool_call": {
+                            "id": tool_use.get("tool_use_id", ""),
+                            "name": tool_use.get("name", ""),
+                            "args": tool_use.get("args", {}),
+                        },
+                    })
+                else:
+                    messages.append({"role": "assistant", "content": content})
+            elif role == "tool":
+                msg = {
+                    "role": "tool",
+                    "content": content,
+                    "name": item.get("name", ""),
+                    "args": item.get("args", {}),
+                }
+                if item.get("tool_use_id"):
+                    msg["tool_call_id"] = item["tool_use_id"]
+                messages.append(msg)
+        return messages
 
     def _render_sections_without_reduction(self, section_texts, selected_notes=None):
         selected_notes = selected_notes or []
@@ -313,7 +340,7 @@ class ContextManager:
             )
 
         # 优先保留最近的历史，因为下一步决策通常最依赖刚刚发生的工具结果。
-        recent_window = 6
+        recent_window = 12
         recent_start = max(0, len(history) - recent_window)
         history_entries, history_details = self._compressed_history_entries(history, recent_start)
         rendered_entries = []

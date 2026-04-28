@@ -95,9 +95,9 @@ def test_agent_only_stores_reusable_epistemic_notes(tmp_path):
     )
 
     assert resumed.ask("What color is the deploy key?") == "It is red."
-    prompt = resumed.model_client.prompts[-1]
-    assert "Relevant memory" in prompt
-    assert "deploy key is red" in prompt
+    system = resumed.model_client.systems[-1]
+    assert "Relevant memory" in system
+    assert "deploy key is red" in system
 
 
 def test_file_summary_cache_is_invalidated_on_out_of_band_edit_and_path_spelling(tmp_path):
@@ -164,7 +164,7 @@ def test_agent_accepts_xml_write_file_tool(tmp_path):
     agent = build_agent(
         tmp_path,
         [
-            '<tool name="write_file" path="hello.py"><content>print("hi")\n</content></tool>',
+            '<tool>{"name":"write_file","args":{"path":"hello.py","content":"print(\\"hi\\")\\n"}}</tool>',
             "<final>Done.</final>",
         ],
     )
@@ -878,7 +878,8 @@ def test_prompt_budget_metadata_records_budget_decisions(tmp_path):
     prompt_events = [event for event in trace_events if event["event"] == "prompt_built"]
     assert prompt_events
     metadata = prompt_events[0]["prompt_metadata"]
-    relevant_section = agent.model_client.prompts[0].split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]
+    system = agent.model_client.systems[0]
+    relevant_section = system.split("Relevant memory:\n", 1)[1].split("\n\n", 1)[0]
 
     assert metadata["relevant_memory"]["selected_count"] == 3
     assert len(metadata["relevant_memory"]["rendered_notes"]) == 3
@@ -893,8 +894,8 @@ def test_prompt_budget_metadata_records_budget_decisions(tmp_path):
 def test_prompt_metadata_refreshes_prefix_when_workspace_changes(tmp_path):
     agent = build_agent(tmp_path, [])
 
-    first = agent.prompt_metadata("first", "")
-    second = agent.prompt_metadata("second", "")
+    _, _, first = agent._build_prompt_and_metadata("first")
+    _, _, second = agent._build_prompt_and_metadata("second")
 
     assert first["prefix_hash"] == second["prefix_hash"]
     assert second["prefix_changed"] is False
@@ -902,7 +903,7 @@ def test_prompt_metadata_refreshes_prefix_when_workspace_changes(tmp_path):
 
     (tmp_path / "README.md").write_text("demo changed\n", encoding="utf-8")
 
-    third = agent.prompt_metadata("third", "")
+    _, _, third = agent._build_prompt_and_metadata("third")
 
     assert third["prefix_hash"] != second["prefix_hash"]
     assert third["prefix_changed"] is True
@@ -992,11 +993,11 @@ def test_resume_prompt_uses_checkpoint_state_not_just_history(tmp_path):
 
     assert resumed.ask("Continue the task") == "Resumed."
 
-    prompt = resumed.model_client.prompts[-1]
-    assert "Task checkpoint:" in prompt
-    assert "Current goal: Fix failing resume flow" in prompt
-    assert "Current blocker: Need to re-anchor stale file facts" in prompt
-    assert "Next step: Re-read runtime.py and refresh the checkpoint" in prompt
+    system = resumed.model_client.systems[-1]
+    assert "Task checkpoint:" in system
+    assert "Current goal: Fix failing resume flow" in system
+    assert "Current blocker: Need to re-anchor stale file facts" in system
+    assert "Next step: Re-read runtime.py and refresh the checkpoint" in system
 
 
 def test_resume_invalidates_stale_file_summaries_and_marks_partial_stale(tmp_path):
@@ -1173,7 +1174,7 @@ def test_resume_marks_no_checkpoint_when_session_has_no_checkpoint_state(tmp_pat
 
     assert resumed.ask("Continue the task") == "Resumed."
     assert resumed.last_prompt_metadata["resume_status"] == "no-checkpoint"
-    assert "Task checkpoint:" not in resumed.model_client.prompts[-1]
+    assert "Task checkpoint:" not in resumed.model_client.systems[-1]
 
 
 def test_freshness_mismatch_creates_checkpoint_before_model_completion(tmp_path):
@@ -1469,13 +1470,14 @@ def test_explicit_memory_promotion_dedupes_duplicate_durable_note(tmp_path):
 def test_agent_records_model_cache_metadata_in_last_prompt_metadata(tmp_path):
     class CacheAwareFakeModelClient(FakeModelClient):
         def complete(self, prompt, max_new_tokens, **kwargs):
-            self.last_completion_metadata = {
+            result = super().complete(prompt, max_new_tokens, **kwargs)
+            self.last_completion_metadata.update({
                 "prompt_cache_supported": True,
                 "cached_tokens": 512,
                 "cache_hit": True,
                 "input_tokens": 1024,
-            }
-            return super().complete(prompt, max_new_tokens, **kwargs)
+            })
+            return result
 
     workspace = build_workspace(tmp_path)
     store = SessionStore(tmp_path / ".pico" / "sessions")
@@ -1511,10 +1513,10 @@ def test_recent_transcript_entries_stay_richer_than_older_ones(tmp_path):
 
     assert agent.ask("Check the transcript") == "Done."
 
-    prompt = agent.model_client.prompts[-1]
+    messages_text = json.dumps(agent.model_client.prompts[-1])
 
-    assert recent_text in prompt
-    assert old_text not in prompt
+    assert recent_text in messages_text
+    assert old_text not in messages_text
 
 
 def test_public_api_exports_resolve_through_package_path():

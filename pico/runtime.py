@@ -52,6 +52,13 @@ DURABLE_MEMORY_LINE_PATTERNS = (
 SECRET_SHAPED_TEXT_PATTERN = re.compile(r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,})")
 
 
+def _strip_final_tag(raw):
+    raw = raw.strip()
+    if raw.startswith("<final>") and raw.endswith("</final>"):
+        return raw[len("<final>"):-len("</final>")].strip()
+    return raw
+
+
 @dataclass
 class PromptPrefix:
     # prefix 除了文本本身，还带一小份元数据，
@@ -93,7 +100,7 @@ class Pico:
         session=None,
         run_store=None,
         approval_policy="ask",
-        max_steps=6,
+        max_steps=15,
         max_new_tokens=512,
         depth=0,
         max_depth=1,
@@ -321,37 +328,14 @@ class Pico:
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
     def build_prefix(self):
-        tool_lines = []
-        for name, tool in self.tools.items():
-            fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
-            risk = "approval required" if tool["risky"] else "safe"
-            tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
-        tool_text = "\n".join(tool_lines)
-        examples = "\n".join(
-            [
-                '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
-                '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
-                '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-                '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-                '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-                "<final>Done.</final>",
-            ]
-        )
-        # prefix 可以理解成 agent 的“工作手册”：
-        # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
+        # 系统提示词：告诉模型它是谁、规则是什么、当前仓库状态。
+        # 工具定义通过 API 原生 function calling 传递，不写在这里。
         text = textwrap.dedent(
             f"""\
             You are pico, a small local coding agent working inside a local repository.
 
             Rules:
             - Use tools instead of guessing about the workspace.
-            - Return exactly one <tool>...</tool> or one <final>...</final>.
-            - Tool calls must look like:
-              <tool>{{"name":"tool_name","args":{{...}}}}</tool>
-            - For write_file and patch_file with multi-line text, prefer XML style:
-              <tool name="write_file" path="file.py"><content>...</content></tool>
-            - Final answers must look like:
-              <final>your answer</final>
             - Never invent tool results.
             - Keep answers concise and concrete.
             - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
@@ -359,13 +343,7 @@ class Pico:
             - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
             - New files should be complete and runnable, including obvious imports.
             - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
-            - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
-
-            Tools:
-            {tool_text}
-
-            Valid response examples:
-            {examples}
+            - Required tool arguments must not be empty.
 
             {self.workspace.text()}
             """
@@ -415,7 +393,7 @@ class Pico:
 
         lines = []
         seen_reads = set()
-        recent_start = max(0, len(history) - 6)
+        recent_start = max(0, len(history) - 12)
         for index, item in enumerate(history):
             recent = index >= recent_start
             if item["role"] == "tool" and item["name"] == "read_file" and not recent:
@@ -436,10 +414,6 @@ class Pico:
 
     def feature_enabled(self, name):
         return bool(self.feature_flags.get(str(name), False))
-
-    def prompt(self, user_message):
-        prompt, _ = self._build_prompt_and_metadata(user_message)
-        return prompt
 
     def record(self, item):
         self.session["history"].append(item)
@@ -525,16 +499,10 @@ class Pico:
                     env[key] = os.environ[key]
         return env
 
-    def prompt_metadata(self, user_message, prompt):
-        _, metadata = self._build_prompt_and_metadata(user_message)
-        return metadata
-
     def _build_prompt_and_metadata(self, user_message):
         refresh = self.refresh_prefix()
         self.resume_state = self.evaluate_resume_state()
-        prompt, metadata = self.context_manager.build(user_message)
-        # 这里把“这轮 prompt 是怎么拼出来的”连同缓存相关状态一起记下来，
-        # 后面 trace/report 才能解释清楚：为什么这一轮 prefix 变了、缓存有没有命中。
+        system, messages, metadata = self.context_manager.build(user_message)
         metadata.update(
             {
                 "prefix_chars": len(self.prefix),
@@ -559,13 +527,13 @@ class Pico:
             }
         )
         metadata.update(self.detected_secret_env_summary())
-        return prompt, metadata
+        return system, messages, metadata
 
     def emit_trace(self, task_state, event, payload=None):
         payload = self.redact_artifact(payload or {})
         payload["event"] = event
         payload["created_at"] = now()
-        # trace 是运行中的逐事件时间线，适合回答“这一轮 agent 到底做了什么”。
+        # trace 是运行中的逐事件时间线，适合回答"这一轮 agent 到底做了什么"。
         self.run_store.append_trace(task_state, payload)
         return payload
 
@@ -649,7 +617,7 @@ class Pico:
 
         为什么存在：
         并不是每个工具结果都值得长期带进下一轮 prompt。完整结果已经进了
-        `history`，这里只挑少量“下一轮大概率还会用到”的事实做提纯，
+        `history`，这里只挑少量"下一轮大概率还会用到"的事实做提纯，
         例如最近读写过哪些文件、某个文件读出来的短摘要。
 
         输入 / 输出：
@@ -810,7 +778,7 @@ class Pico:
             task_state.record_attempt()
             self.run_store.write_task_state(task_state)
             prompt_started_at = time.monotonic()
-            prompt, prompt_metadata = self._build_prompt_and_metadata(user_message)
+            system, messages, prompt_metadata = self._build_prompt_and_metadata(user_message)
             self.emit_trace(
                 task_state,
                 "prompt_built",
@@ -874,12 +842,15 @@ class Pico:
                 # 只有后端明确支持时，才把稳定前缀的 hash 作为 cache key 发出去。
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
                 prompt_cache_retention = "in_memory"
+            tools = toolkit.get_tools_for_api(self)
             model_started_at = time.monotonic()
             raw = self.model_client.complete(
-                prompt,
+                messages,
                 self.max_new_tokens,
                 prompt_cache_key=prompt_cache_key,
                 prompt_cache_retention=prompt_cache_retention,
+                tools=tools,
+                system=system,
             )
             completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
             if completion_metadata:
@@ -888,7 +859,13 @@ class Pico:
                 prompt_metadata.update(completion_metadata)
             self.last_completion_metadata = completion_metadata
             self.last_prompt_metadata = prompt_metadata
-            kind, payload = self.parse(raw)
+            tool_use = completion_metadata.get("tool_use")
+            if tool_use:
+                kind = "tool"
+            elif not raw.strip() or "<tool" in raw:
+                kind = "retry"
+            else:
+                kind = "final"
             self.emit_trace(
                 task_state,
                 "model_parsed",
@@ -901,8 +878,9 @@ class Pico:
 
             if kind == "tool":
                 tool_steps += 1
-                name = payload.get("name", "")
-                args = payload.get("args", {})
+                name = tool_use.get("name", "")
+                args = tool_use.get("args", {})
+                tool_use_id = tool_use.get("tool_use_id", "")
                 # 打印工具调用信息到控制台
                 print(f"[Tool] {name}({json.dumps(args, ensure_ascii=False)})")
                 task_state.record_tool(name)
@@ -910,10 +888,19 @@ class Pico:
                 result = self.run_tool(name, args)
                 self.record(
                     {
+                        "role": "assistant",
+                        "content": raw,
+                        "tool_use": {"name": name, "args": args, "tool_use_id": tool_use_id},
+                        "created_at": now(),
+                    }
+                )
+                self.record(
+                    {
                         "role": "tool",
                         "name": name,
                         "args": args,
                         "content": result,
+                        "tool_use_id": tool_use_id,
                         "created_at": now(),
                     }
                 )
@@ -942,11 +929,15 @@ class Pico:
                 continue
 
             if kind == "retry":
-                self.record({"role": "assistant", "content": payload, "created_at": now()})
+                if "<tool" in raw:
+                    notice = "Runtime notice: malformed tool output. Reply with a valid <tool> call or a non-empty final answer."
+                else:
+                    notice = "Runtime notice: model returned an empty response"
+                self.record({"role": "assistant", "content": notice, "created_at": now()})
                 self.run_store.write_task_state(task_state)
                 continue
 
-            final = (payload or raw).strip()
+            final = _strip_final_tag(raw)
             self.record({"role": "assistant", "content": final, "created_at": now()})
             task_state.finish_success(final)
             self.promote_durable_memory(user_message, final)
@@ -1008,8 +999,8 @@ class Pico:
         """执行一次工具调用，并在执行前后套上完整护栏。
 
         为什么存在：
-        在 agent 系统里，真正危险的不是“模型会不会想调用工具”，而是
-        “平台有没有在执行前把边界守住”。这个函数就是工具层的总闸口：
+        在 agent 系统里，真正危险的不是"模型会不会想调用工具"，而是
+        "平台有没有在执行前把边界守住"。这个函数就是工具层的总闸口：
         所有工具调用都必须先经过它，不能让模型直接碰到底层函数。
 
         输入 / 输出：
@@ -1018,12 +1009,12 @@ class Pico:
           这样模型下一轮都能继续消费这份反馈。
 
         在 agent 链路里的位置：
-        它位于 `ask()` 的“模型决定要调用工具”之后，是控制循环里真正把模型
+        它位于 `ask()` 的"模型决定要调用工具"之后，是控制循环里真正把模型
         意图落到外部世界的一步。因此这里串起了几乎所有安全与可控设计：
         工具是否存在、参数是否合法、是否重复、是否需要审批、执行结果是否裁剪、
         是否需要回写记忆。
         """
-        # 工具执行不是“直接调函数”，而是一条带护栏的流水线：
+        # 工具执行不是"直接调函数"，而是一条带护栏的流水线：
         # 工具是否存在 -> 参数是否合法 -> 是否重复调用 -> 是否通过审批
         # -> 真正执行 -> 更新记忆。
         tool = self.tools.get(name)
@@ -1214,126 +1205,6 @@ class Pico:
         except EOFError:
             return False
         return answer.strip().lower() in {"y", "yes"}
-
-    @staticmethod
-    def parse(raw):
-        """把模型原始输出解析成 runtime 可执行的动作或最终答案。
-
-        为什么存在：
-        模型输出首先是自然语言文本，而 runtime 需要的是结构化决策：
-        “这是工具调用”还是“这是最终答案”。如果没有这层解析，后面的工具校验、
-        审批和执行链路就没法可靠工作。
-
-        输入 / 输出：
-        - 输入：模型返回的原始文本 `raw`
-        - 输出：`(kind, payload)`，其中 `kind` 可能是 `tool`、`final`、`retry`
-
-        在 agent 链路里的位置：
-        它位于 `model_client.complete()` 之后、`run_tool()` 之前，是模型输出
-        进入平台控制流的第一道结构化关口。
-        """
-        raw = str(raw)
-        # 这里支持两种工具格式：
-        # 1. <tool>...</tool> 里包 JSON，适合简短调用
-        # 2. XML 风格属性/子标签，适合写文件这类多行内容
-        if "<tool>" in raw and ("<final>" not in raw or raw.find("<tool>") < raw.find("<final>")):
-            body = Pico.extract(raw, "tool")
-            try:
-                payload = json.loads(body)
-            except Exception:
-                return "retry", Pico.retry_notice("model returned malformed tool JSON")
-            if not isinstance(payload, dict):
-                return "retry", Pico.retry_notice("tool payload must be a JSON object")
-            if not str(payload.get("name", "")).strip():
-                return "retry", Pico.retry_notice("tool payload is missing a tool name")
-            args = payload.get("args", {})
-            if args is None:
-                payload["args"] = {}
-            elif not isinstance(args, dict):
-                return "retry", Pico.retry_notice()
-            return "tool", payload
-        if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
-            payload = Pico.parse_xml_tool(raw)
-            if payload is not None:
-                return "tool", payload
-            return "retry", Pico.retry_notice()
-        if "<final>" in raw:
-            final = Pico.extract(raw, "final").strip()
-            if final:
-                return "final", final
-            return "retry", Pico.retry_notice("model returned an empty <final> answer")
-        raw = raw.strip()
-        if raw:
-            return "final", raw
-        return "retry", Pico.retry_notice("model returned an empty response")
-
-    @staticmethod
-    def retry_notice(problem=None):
-        prefix = "Runtime notice"
-        if problem:
-            prefix += f": {problem}"
-        else:
-            prefix += ": model returned malformed tool output"
-        return (
-            f"{prefix}. Reply with a valid <tool> call or a non-empty <final> answer. "
-            'For multi-line files, prefer <tool name="write_file" path="file.py"><content>...</content></tool>.'
-        )
-
-    @staticmethod
-    def parse_xml_tool(raw):
-        match = re.search(r"<tool(?P<attrs>[^>]*)>(?P<body>.*?)</tool>", raw, re.S)
-        if not match:
-            return None
-        attrs = Pico.parse_attrs(match.group("attrs"))
-        name = str(attrs.pop("name", "")).strip()
-        if not name:
-            return None
-
-        body = match.group("body")
-        args = dict(attrs)
-        for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path"):
-            if f"<{key}>" in body:
-                args[key] = Pico.extract_raw(body, key)
-
-        body_text = body.strip("\n")
-        if name == "write_file" and "content" not in args and body_text:
-            args["content"] = body_text
-        if name == "delegate" and "task" not in args and body_text:
-            args["task"] = body_text.strip()
-        return {"name": name, "args": args}
-
-    @staticmethod
-    def parse_attrs(text):
-        attrs = {}
-        for match in re.finditer(r"""([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""", text):
-            attrs[match.group(1)] = match.group(2) if match.group(2) is not None else match.group(3)
-        return attrs
-
-    @staticmethod
-    def extract(text, tag):
-        start_tag = f"<{tag}>"
-        end_tag = f"</{tag}>"
-        start = text.find(start_tag)
-        if start == -1:
-            return text
-        start += len(start_tag)
-        end = text.find(end_tag, start)
-        if end == -1:
-            return text[start:].strip()
-        return text[start:end].strip()
-
-    @staticmethod
-    def extract_raw(text, tag):
-        start_tag = f"<{tag}>"
-        end_tag = f"</{tag}>"
-        start = text.find(start_tag)
-        if start == -1:
-            return text
-        start += len(start_tag)
-        end = text.find(end_tag, start)
-        if end == -1:
-            return text[start:]
-        return text[start:end]
 
     def reset(self):
         self.session["history"] = []

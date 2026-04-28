@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from pico.models import AnthropicCompatibleModelClient, OpenAICompatibleModelClient, FakeModelClient, OllamaModelClient; print\\('imports OK'\\)\")",
+      "Bash(python -m pytest tests/ --ignore=tests/test_evaluator.py -x -q)",
+      "Bash(python -c \"from pico.models import OpenAICompatibleModelClient; print\\('OK'\\); import json; c = OpenAICompatibleModelClient\\('test', 'http://x', 'k', 0.2, 30\\); from pico.runtime import Pico; print\\('all imports OK'\\)\")",
+      "Bash(python -c \"from pico.runtime import Pico; print\\('OK'\\)\")",
+      "Bash(git checkout *)",
+      "Bash(python -c \"from pico.runtime import Pico; from pico.context_manager import ContextManager; from pico.models import AnthropicCompatibleModelClient, OpenAICompatibleModelClient; print\\('all imports OK'\\)\")",
+      "Bash(python)",
+      "Bash(python3 -c \"with open\\('d:/code/pico/pico/context_manager.py','r',encoding='utf-8'\\) as f: content=f.read\\(\\); print\\('curly' if '“' in content else 'no curly'\\)\")",
+      "Bash(python -m pytest tests/test_pico.py -x -q)",
+      "Bash(python -c ' *)",
+      "Bash(python -m pytest tests/test_pico.py -q)",
+      "Bash(python -m pytest tests/test_pico.py::test_recent_transcript_entries_stay_richer_than_older_ones -vv)",
+      "Bash(python -m pytest tests/test_pico.py -q --ignore-glob=\"*reviewer*\" -k \"not test_reviewer\")"
+    ]
+  }
+}

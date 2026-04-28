@@ -17,15 +17,21 @@ class FakeModelClient:
         self.outputs = list(outputs)
         self.prompts = []
         self.supports_prompt_cache = False
+        self.supports_native_tools = False
         self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, **kwargs):
         self.prompts.append(prompt)
-        if not getattr(self, "last_completion_metadata", None):
-            self.last_completion_metadata = {}
+        self.systems = getattr(self, "systems", [])
+        self.systems.append(kwargs.get("system", ""))
+        self.last_completion_metadata = {}
         if not self.outputs:
             raise RuntimeError("fake model ran out of outputs")
-        return self.outputs.pop(0)
+        raw = self.outputs.pop(0)
+        tool_use = _parse_fake_tool_use(raw)
+        if tool_use:
+            self.last_completion_metadata["tool_use"] = tool_use
+        return raw
 
 
 class OllamaModelClient:
@@ -36,6 +42,7 @@ class OllamaModelClient:
         self.top_p = top_p
         self.timeout = timeout
         self.supports_prompt_cache = False
+        self.supports_native_tools = False
         self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, **kwargs):
@@ -229,27 +236,23 @@ class OpenAICompatibleModelClient:
         self.temperature = temperature
         self.timeout = timeout
         # 当前只在明确支持 prompt cache 语义的后端上启用这条链路，
-        # 避免对不支持的后端传一个“看起来统一、其实没意义”的伪参数。
-        self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes", "timicc.com")) 
+        # 避免对不支持的后端传一个"看起来统一、其实没意义"的伪参数。
+        self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes", "timicc.com"))
+        self.supports_native_tools = True
         self.last_completion_metadata = {}
 
-    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
-        """向 OpenAI-compatible `/responses` 接口发起一次模型调用。
+    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None, tools=None, system=None):
+        """向 OpenAI-compatible 接口发起一次模型调用。
 
-        为什么存在：
-        runtime 不应该知道 HTTP 细节、SSE 细节、usage 字段长什么样，
-        更不应该自己去判断 prompt cache 参数要不要带。这个函数把这些后端
-        细节都包起来，对上层暴露统一的 `complete()` 行为。
-
-        输入 / 输出：
-        - 输入：完整 prompt、最大输出 token，以及可选的 prompt cache 参数
-        - 输出：模型最终文本；同时把 usage / cached_tokens 等元数据写进
-          `self.last_completion_metadata`
-
-        在 agent 链路里的位置：
-        它位于 `Pico.ask()` 的模型调用阶段，是稳定前缀缓存复用链路真正
-        落到 provider API 的地方。
+        当 tools 不为 None 且 prompt 是 list 时，使用原生 function calling 模式；
+        否则走旧的纯文本 prompt 模式。
         """
+        if tools is not None and isinstance(prompt, list):
+            return self._complete_native(prompt, max_new_tokens, tools, system, prompt_cache_key, prompt_cache_retention)
+
+        return self._complete_legacy(prompt, max_new_tokens, prompt_cache_key, prompt_cache_retention)
+
+    def _complete_legacy(self, prompt, max_new_tokens, prompt_cache_key, prompt_cache_retention):
         self.last_completion_metadata = {}
         payload = {
             "model": self.model,
@@ -269,7 +272,7 @@ class OpenAICompatibleModelClient:
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
-        # runtime 传入的是“稳定前缀”的签名，而不是整段 prompt 的签名。
+        # runtime 传入的是"稳定前缀"的签名，而不是整段 prompt 的签名。
         # 这样缓存复用针对的是稳定段，不会因为动态 history 每轮变化而失效。
         if self.supports_prompt_cache and prompt_cache_key:
             payload["prompt_cache_key"] = prompt_cache_key
@@ -343,6 +346,118 @@ class OpenAICompatibleModelClient:
         }
         return _extract_openai_text(data)
 
+    def _complete_native(self, messages, max_new_tokens, tools, system, prompt_cache_key, prompt_cache_retention):
+        """使用 OpenAI Responses API 的原生 function calling。"""
+        self.last_completion_metadata = {}
+
+        openai_input = []
+        if system:
+            openai_input.append({"role": "system", "content": system})
+
+        for msg in messages:
+            openai_input.extend(_generic_msg_to_openai_input(msg))
+
+        openai_tools = _tools_to_openai_format(tools)
+
+        payload = {
+            "model": self.model,
+            "input": openai_input,
+            "tools": openai_tools,
+            "max_output_tokens": max_new_tokens,
+            "stream": False,
+        }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        if self.supports_prompt_cache and prompt_cache_key:
+            payload["prompt_cache_key"] = prompt_cache_key
+        if self.supports_prompt_cache and prompt_cache_retention:
+            payload["prompt_cache_retention"] = prompt_cache_retention
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        request = urllib.request.Request(
+            self.base_url + "/responses",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        attempts = 3
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    body_text = response.read().decode("utf-8")
+                    resp_headers = getattr(response, "headers", {}) or {}
+                    content_type = resp_headers.get("Content-Type", "")
+                break
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code >= 500 and attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
+            except (urllib.error.URLError, RemoteDisconnected) as exc:
+                if attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(
+                    "Could not reach the OpenAI-compatible backend.\n"
+                    f"Base URL: {self.base_url}\n"
+                    f"Model: {self.model}"
+                ) from exc
+
+        if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
+            text, response_data = _extract_openai_response_from_sse(body_text)
+            self.last_completion_metadata = {
+                "prompt_cache_supported": self.supports_prompt_cache,
+                "prompt_cache_key": prompt_cache_key,
+                "prompt_cache_retention": prompt_cache_retention,
+                **_extract_usage_cache_details(response_data),
+            }
+            tool_use = _extract_openai_tool_use(response_data)
+            if tool_use:
+                self.last_completion_metadata["tool_use"] = tool_use
+            if text:
+                return text
+            return ""
+
+        try:
+            data = json.loads(body_text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "OpenAI-compatible error: backend returned non-JSON content that could not be parsed"
+            ) from exc
+        if data.get("error"):
+            raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
+
+        self.last_completion_metadata = {
+            "prompt_cache_supported": self.supports_prompt_cache,
+            "prompt_cache_key": prompt_cache_key,
+            "prompt_cache_retention": prompt_cache_retention,
+            **_extract_usage_cache_details(data),
+        }
+        tool_use = _extract_openai_tool_use(data)
+        if tool_use:
+            self.last_completion_metadata["tool_use"] = tool_use
+        return _extract_openai_text(data)
+
+
+def _parse_fake_tool_use(raw):
+    """从 <tool>...</tool> 格式的 fake 输出中提取 tool_use，供 FakeModelClient 使用。"""
+    import re
+    m = re.search(r"<tool>\s*(\{.*?\})\s*</tool>", raw, re.S)
+    if m:
+        try:
+            payload = json.loads(m.group(1))
+            name = str(payload.get("name", "")).strip()
+            args = payload.get("args", {})
+            if name and isinstance(args, dict):
+                return {"name": name, "args": args, "tool_use_id": "fake-id"}
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return None
+
 
 def _extract_anthropic_text(data):
     for item in data.get("content", []):
@@ -353,6 +468,117 @@ def _extract_anthropic_text(data):
     return ""
 
 
+def _extract_openai_tool_use(data):
+    """从 OpenAI Responses API 响应中提取 function_call。"""
+    for item in data.get("output", []):
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            args_str = item.get("arguments", "{}")
+            try:
+                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+            except json.JSONDecodeError:
+                args = {}
+            return {
+                "name": item.get("name", ""),
+                "args": args,
+                "tool_use_id": item.get("call_id", item.get("id", "")),
+            }
+    return None
+
+
+def _tools_to_openai_format(tools):
+    """将 get_tools_for_api 返回的工具定义转为 OpenAI Responses 格式。"""
+    result = []
+    for tool in tools:
+        result.append({
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": {
+                    **tool.get("input_schema", {}),
+                    "additionalProperties": False,
+                },
+            },
+        })
+    return result
+
+
+def _generic_msg_to_openai_input(msg):
+    """将通用结构化消息转为 OpenAI Responses API 的 input 项。
+
+    function_call 必须作为 input 数组的顶层 item，不能嵌套在 assistant 消息
+    的 content 里；同时需要 id 和 call_id 两个字段，function_call_output
+    通过 call_id 引用。
+    """
+    role = msg.get("role", "")
+    content = msg.get("content", "")
+    tool_call = msg.get("tool_call")
+
+    if role == "user":
+        return [{"role": "user", "content": content}]
+
+    if role == "assistant":
+        items = []
+        if content:
+            items.append({"role": "assistant", "content": content})
+        if tool_call:
+            call_id = tool_call.get("id", "")
+            items.append({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": tool_call.get("name", ""),
+                "arguments": json.dumps(tool_call.get("args", {}), ensure_ascii=False),
+            })
+        if not items:
+            items.append({"role": "assistant", "content": ""})
+        return items
+
+    if role == "tool":
+        return [{
+            "type": "function_call_output",
+            "call_id": msg.get("tool_call_id", ""),
+            "output": content,
+        }]
+
+    return []
+
+
+def _generic_msg_to_anthropic(msg):
+    """将通用结构化消息转为 Anthropic Messages API 的消息格式。"""
+    role = msg.get("role", "")
+    content = msg.get("content", "")
+    tool_call = msg.get("tool_call")
+
+    if role == "user":
+        return {"role": "user", "content": [{"type": "text", "text": content}]}
+
+    if role == "assistant":
+        if tool_call:
+            blocks = []
+            if content:
+                blocks.append({"type": "text", "text": content})
+            blocks.append({
+                "type": "tool_use",
+                "id": tool_call.get("id", ""),
+                "name": tool_call.get("name", ""),
+                "input": tool_call.get("args", {}),
+            })
+            return {"role": "assistant", "content": blocks}
+        return {"role": "assistant", "content": [{"type": "text", "text": content}]}
+
+    if role == "tool":
+        return {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": msg.get("tool_call_id", ""),
+                "content": content,
+            }],
+        }
+
+    return {"role": "user", "content": [{"type": "text", "text": content}]}
+
+
 class AnthropicCompatibleModelClient:
     def __init__(self, model, base_url, api_key, temperature, timeout):
         self.model = model
@@ -361,12 +587,24 @@ class AnthropicCompatibleModelClient:
         self.temperature = temperature
         self.timeout = timeout
         self.supports_prompt_cache = False
+        self.supports_native_tools = True
         self.last_completion_metadata = {}
 
-    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
-        # 为了保持统一接口，runtime 仍然会传缓存参数进来；
-        # 这里只是显式丢弃，因为当前 Anthropic-compatible 路径没有接缓存复用。
+    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None, tools=None, system=None):
+        """向 Anthropic-compatible `/messages` 接口发起一次模型调用。
+
+        当 tools 不为 None 且 prompt 是 list 时，使用原生 function calling 模式；
+        否则走旧的纯文本 prompt 模式。
+        """
         del prompt_cache_key, prompt_cache_retention
+        self.last_completion_metadata = {}
+
+        if tools is not None and isinstance(prompt, list):
+            return self._complete_native(prompt, max_new_tokens, tools, system)
+
+        return self._complete_legacy(prompt, max_new_tokens)
+
+    def _complete_legacy(self, prompt, max_new_tokens):
         self.last_completion_metadata = {}
         payload = {
             "model": self.model,
@@ -433,3 +671,102 @@ class AnthropicCompatibleModelClient:
         if text:
             return text
         raise RuntimeError("Anthropic-compatible error: could not extract text from response")
+
+    def _complete_native(self, messages, max_new_tokens, tools, system):
+        anthropic_messages = [_generic_msg_to_anthropic(msg) for msg in messages]
+        payload = {
+            "model": self.model,
+            "messages": anthropic_messages,
+            "max_tokens": max_new_tokens,
+            "tools": tools,
+            "stream": False,
+        }
+        if system:
+            payload["system"] = system
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+        }
+
+        request = urllib.request.Request(
+            self.base_url + "/messages",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        attempts = 3
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    body_text = response.read().decode("utf-8")
+                break
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code >= 500 and attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"Anthropic-compatible request failed with HTTP {exc.code}: {body}") from exc
+            except (urllib.error.URLError, RemoteDisconnected) as exc:
+                if attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(
+                    "Could not reach the Anthropic-compatible backend.\n"
+                    f"Base URL: {self.base_url}\n"
+                    f"Model: {self.model}"
+                ) from exc
+
+        try:
+            data = json.loads(body_text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "Anthropic-compatible error: backend returned non-JSON content that could not be parsed"
+            ) from exc
+        if data.get("error"):
+            raise RuntimeError(f"Anthropic-compatible error: {data['error']}")
+
+        usage = data.get("usage") or {}
+        self.last_completion_metadata = {
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "stop_reason": data.get("stop_reason", ""),
+        }
+
+        tool_use = _extract_anthropic_tool_use(data)
+        if tool_use:
+            self.last_completion_metadata["tool_use"] = tool_use
+
+        text = _extract_anthropic_text(data)
+        return text if text else ""
+
+    def _send_http(self, url, payload, headers):
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        attempts = 3
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return response.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code >= 500 and attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"Anthropic-compatible request failed with HTTP {exc.code}: {body}") from exc
+            except (urllib.error.URLError, RemoteDisconnected) as exc:
+                if attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(
+                    "Could not reach the Anthropic-compatible backend.\n"
+                    f"Base URL: {self.base_url}\n"
+                    f"Model: {self.model}"
+                ) from exc
