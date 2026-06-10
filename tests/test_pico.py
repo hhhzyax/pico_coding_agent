@@ -371,24 +371,19 @@ def test_openai_compatible_client_posts_expected_responses_payload():
         result = client.complete("hello", 42)
 
     assert result == "<final>ok</final>"
-    assert captured["url"] == "https://right.codes/v1/responses"
+    assert captured["url"] == "https://right.codes/v1/chat/completions"
     assert captured["timeout"] == 30
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
     assert captured["headers"]["Content-type"] == "application/json"
     assert captured["body"] == {
         "model": "right.codes/codex-mini",
-        "input": [
+        "messages": [
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": "hello",
-                    }
-                ],
+                "content": "hello",
             }
         ],
-        "max_output_tokens": 42,
+        "max_tokens": 42,
         "stream": False,
         "temperature": 0.2,
     }
@@ -443,9 +438,8 @@ def test_openai_compatible_client_sends_prompt_cache_fields_and_records_usage():
         )
 
     assert result == "<final>ok</final>"
-    assert captured["body"]["prompt_cache_key"] == "prefix-hash-123"
-    assert captured["body"]["prompt_cache_retention"] == "in_memory"
-    assert client.last_completion_metadata["prompt_cache_supported"] is True
+    assert "prompt_cache_key" not in captured["body"]
+    assert "prompt_cache_retention" not in captured["body"]
     assert client.last_completion_metadata["cached_tokens"] == 1536
     assert client.last_completion_metadata["cache_hit"] is True
     assert client.last_completion_metadata["input_tokens"] == 2048
@@ -463,8 +457,7 @@ def test_openai_compatible_client_extracts_text_from_event_stream():
 
         def read(self):
             return (
-                'data: {"type":"response.created","response":{"id":"resp_1","output":[]}}\n'
-                'data: {"type":"response.completed","response":{"output":[{"content":[{"text":"<final>stream ok</final>"}]}]}}\n'
+                'data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"<final>stream ok</final>"},"finish_reason":"stop"}]}\n'
                 "data: [DONE]\n"
             ).encode("utf-8")
 
@@ -494,12 +487,9 @@ def test_openai_compatible_client_extracts_text_from_event_stream_deltas():
 
         def read(self):
             return (
-                'event: response.output_text.delta\n'
-                'data: {"type":"response.output_text.delta","delta":"<final>"}\n'
-                'event: response.output_text.delta\n'
-                'data: {"type":"response.output_text.delta","delta":"OK"}\n'
-                'event: response.output_text.done\n'
-                'data: {"type":"response.output_text.done","text":"<final>OK</final>"}\n'
+                'data: {"id":"c1","choices":[{"index":0,"delta":{"content":"<final>OK"},"finish_reason":null}]}\n'
+                'data: {"id":"c2","choices":[{"index":0,"delta":{"content":"</final>"},"finish_reason":null}]}\n'
+                'data: {"id":"c3","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n'
                 "data: [DONE]\n"
             ).encode("utf-8")
 

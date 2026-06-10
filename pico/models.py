@@ -121,7 +121,7 @@ def _extract_openai_text(data):
 
 
 def _extract_openai_text_from_sse(body_text):
-    last_response = None
+    # Chat Completions SSE: 累积 choices[0].delta.content
     deltas = []
     for line in body_text.splitlines():
         line = line.strip()
@@ -134,6 +134,15 @@ def _extract_openai_text_from_sse(body_text):
             event = json.loads(payload)
         except json.JSONDecodeError:
             continue
+        # Chat Completions SSE
+        choices = event.get("choices", [])
+        if choices:
+            delta = choices[0].get("delta", {})
+            content = delta.get("content")
+            if isinstance(content, str):
+                deltas.append(content)
+            continue
+        # Responses API SSE (兼容旧格式)
         event_type = event.get("type", "")
         if event_type == "response.output_text.delta":
             delta = event.get("delta")
@@ -156,7 +165,6 @@ def _extract_openai_text_from_sse(body_text):
                 return text
         response = event.get("response")
         if isinstance(response, dict):
-            last_response = response
             text = _extract_openai_text(response)
             if text:
                 return text
@@ -165,14 +173,15 @@ def _extract_openai_text_from_sse(body_text):
             return text
     if deltas:
         return "".join(deltas)
-    if isinstance(last_response, dict):
-        return _extract_openai_text(last_response)
     return ""
 
 
 def _extract_openai_response_from_sse(body_text):
-    last_response = None
+    # Chat Completions SSE: 累积 delta 中的 content 和 tool_calls
     deltas = []
+    tool_calls_by_idx = {}
+    response_data = {}
+
     for line in body_text.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -184,9 +193,35 @@ def _extract_openai_response_from_sse(body_text):
             event = json.loads(payload)
         except json.JSONDecodeError:
             continue
+
+        if "choices" in event:
+            choice = event["choices"][0] if event["choices"] else {}
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if isinstance(content, str):
+                deltas.append(content)
+            for tc in delta.get("tool_calls", []):
+                idx = tc.get("index", 0)
+                if idx not in tool_calls_by_idx:
+                    tool_calls_by_idx[idx] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                merged = tool_calls_by_idx[idx]
+                if tc.get("id"):
+                    merged["id"] = tc["id"]
+                if tc.get("type"):
+                    merged["type"] = tc["type"]
+                if "function" in tc:
+                    if tc["function"].get("name"):
+                        merged["function"]["name"] = tc["function"]["name"]
+                    if tc["function"].get("arguments"):
+                        merged["function"]["arguments"] += tc["function"]["arguments"]
+            if event.get("usage"):
+                response_data["usage"] = event["usage"]
+            continue
+
+        # Responses API SSE (兼容旧格式)
         response = event.get("response")
         if isinstance(response, dict):
-            last_response = response
+            response_data = response
             if event.get("type") == "response.completed":
                 text = _extract_openai_text(response)
                 if text:
@@ -199,16 +234,21 @@ def _extract_openai_response_from_sse(body_text):
         elif event_type == "response.output_text.done":
             text = event.get("text")
             if isinstance(text, str) and text:
-                return text, last_response or {}
+                return text, response_data or {}
         else:
             text = _extract_openai_text(event)
             if text:
                 return text, event
-    if deltas:
-        return "".join(deltas), last_response or {}
-    if isinstance(last_response, dict):
-        return _extract_openai_text(last_response), last_response
-    return "", {}
+
+    text = "".join(deltas)
+    if tool_calls_by_idx and not response_data.get("choices"):
+        response_data["choices"] = [{
+            "message": {
+                "content": text,
+                "tool_calls": [tool_calls_by_idx[k] for k in sorted(tool_calls_by_idx)],
+            }
+        }]
+    return text, response_data
 
 
 def _extract_usage_cache_details(data):
@@ -237,7 +277,7 @@ class OpenAICompatibleModelClient:
         self.timeout = timeout
         # 当前只在明确支持 prompt cache 语义的后端上启用这条链路，
         # 避免对不支持的后端传一个"看起来统一、其实没意义"的伪参数。
-        self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes", "timicc.com"))
+        self.supports_prompt_cache = False
         self.supports_native_tools = True
         self.last_completion_metadata = {}
 
@@ -256,35 +296,24 @@ class OpenAICompatibleModelClient:
         self.last_completion_metadata = {}
         payload = {
             "model": self.model,
-            "input": [
+            "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": prompt,
-                        }
-                    ],
+                    "content": prompt,
                 }
             ],
-            "max_output_tokens": max_new_tokens,
+            "max_tokens": max_new_tokens,
             "stream": False,
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
-        # runtime 传入的是"稳定前缀"的签名，而不是整段 prompt 的签名。
-        # 这样缓存复用针对的是稳定段，不会因为动态 history 每轮变化而失效。
-        if self.supports_prompt_cache and prompt_cache_key:
-            payload["prompt_cache_key"] = prompt_cache_key
-        if self.supports_prompt_cache and prompt_cache_retention:
-            payload["prompt_cache_retention"] = prompt_cache_retention
 
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         request = urllib.request.Request(
-            self.base_url + "/responses",
+            self.base_url + "/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             headers=headers,
             method="POST",
@@ -321,9 +350,6 @@ class OpenAICompatibleModelClient:
                 # 这些元数据会一路传回 runtime，进入 trace 和 report，
                 # 用来观察 prompt cache 是否真的命中。
                 self.last_completion_metadata = {
-                    "prompt_cache_supported": self.supports_prompt_cache,
-                    "prompt_cache_key": prompt_cache_key,
-                    "prompt_cache_retention": prompt_cache_retention,
                     **_extract_usage_cache_details(response_data),
                 }
             if text:
@@ -339,46 +365,39 @@ class OpenAICompatibleModelClient:
         if data.get("error"):
             raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
         self.last_completion_metadata = {
-            "prompt_cache_supported": self.supports_prompt_cache,
-            "prompt_cache_key": prompt_cache_key,
-            "prompt_cache_retention": prompt_cache_retention,
             **_extract_usage_cache_details(data),
         }
         return _extract_openai_text(data)
 
     def _complete_native(self, messages, max_new_tokens, tools, system, prompt_cache_key, prompt_cache_retention):
-        """使用 OpenAI Responses API 的原生 function calling。"""
+        """使用 Chat Completions API 的原生 function calling。"""
         self.last_completion_metadata = {}
 
-        openai_input = []
+        openai_messages = []
         if system:
-            openai_input.append({"role": "system", "content": system})
+            openai_messages.append({"role": "system", "content": system})
 
         for msg in messages:
-            openai_input.extend(_generic_msg_to_openai_input(msg))
+            openai_messages.extend(_generic_msg_to_openai_input(msg))
 
         openai_tools = _tools_to_openai_format(tools)
 
         payload = {
             "model": self.model,
-            "input": openai_input,
+            "messages": openai_messages,
             "tools": openai_tools,
-            "max_output_tokens": max_new_tokens,
+            "max_tokens": max_new_tokens,
             "stream": False,
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
-        if self.supports_prompt_cache and prompt_cache_key:
-            payload["prompt_cache_key"] = prompt_cache_key
-        if self.supports_prompt_cache and prompt_cache_retention:
-            payload["prompt_cache_retention"] = prompt_cache_retention
 
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         request = urllib.request.Request(
-            self.base_url + "/responses",
+            self.base_url + "/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             headers=headers,
             method="POST",
@@ -410,9 +429,6 @@ class OpenAICompatibleModelClient:
         if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
             text, response_data = _extract_openai_response_from_sse(body_text)
             self.last_completion_metadata = {
-                "prompt_cache_supported": self.supports_prompt_cache,
-                "prompt_cache_key": prompt_cache_key,
-                "prompt_cache_retention": prompt_cache_retention,
                 **_extract_usage_cache_details(response_data),
             }
             tool_use = _extract_openai_tool_use(response_data)
@@ -432,9 +448,6 @@ class OpenAICompatibleModelClient:
             raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
 
         self.last_completion_metadata = {
-            "prompt_cache_supported": self.supports_prompt_cache,
-            "prompt_cache_key": prompt_cache_key,
-            "prompt_cache_retention": prompt_cache_retention,
             **_extract_usage_cache_details(data),
         }
         tool_use = _extract_openai_tool_use(data)
@@ -469,7 +482,25 @@ def _extract_anthropic_text(data):
 
 
 def _extract_openai_tool_use(data):
-    """从 OpenAI Responses API 响应中提取 function_call。"""
+    """从 Chat Completions 或 Responses API 响应中提取 function_call。"""
+    # Chat Completions 格式: choices[0].message.tool_calls
+    choices = data.get("choices", [])
+    if choices:
+        message = choices[0].get("message", {})
+        tool_calls = message.get("tool_calls", [])
+        if tool_calls:
+            tc = tool_calls[0]
+            args_str = tc.get("function", {}).get("arguments", "{}")
+            try:
+                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+            except json.JSONDecodeError:
+                args = {}
+            return {
+                "name": tc.get("function", {}).get("name", ""),
+                "args": args,
+                "tool_use_id": tc.get("id", ""),
+            }
+    # Responses API 格式 (兼容旧格式): output 数组中的 function_call
     for item in data.get("output", []):
         if isinstance(item, dict) and item.get("type") == "function_call":
             args_str = item.get("arguments", "{}")
@@ -504,11 +535,10 @@ def _tools_to_openai_format(tools):
 
 
 def _generic_msg_to_openai_input(msg):
-    """将通用结构化消息转为 OpenAI Responses API 的 input 项。
+    """将通用结构化消息转为 Chat Completions API 的 messages 项。
 
-    function_call 必须作为 input 数组的顶层 item，不能嵌套在 assistant 消息
-    的 content 里；同时需要 id 和 call_id 两个字段，function_call_output
-    通过 call_id 引用。
+    function_call 嵌套在 assistant 消息的 tool_calls 里，
+    function_call_output 转为 role=tool 消息。
     """
     role = msg.get("role", "")
     content = msg.get("content", "")
@@ -518,26 +548,23 @@ def _generic_msg_to_openai_input(msg):
         return [{"role": "user", "content": content}]
 
     if role == "assistant":
-        items = []
-        if content:
-            items.append({"role": "assistant", "content": content})
+        item = {"role": "assistant", "content": content or ""}
         if tool_call:
-            call_id = tool_call.get("id", "")
-            items.append({
-                "type": "function_call",
-                "call_id": call_id,
-                "name": tool_call.get("name", ""),
-                "arguments": json.dumps(tool_call.get("args", {}), ensure_ascii=False),
-            })
-        if not items:
-            items.append({"role": "assistant", "content": ""})
-        return items
+            item["tool_calls"] = [{
+                "id": tool_call.get("id", ""),
+                "type": "function",
+                "function": {
+                    "name": tool_call.get("name", ""),
+                    "arguments": json.dumps(tool_call.get("args", {}), ensure_ascii=False),
+                },
+            }]
+        return [item]
 
     if role == "tool":
         return [{
-            "type": "function_call_output",
-            "call_id": msg.get("tool_call_id", ""),
-            "output": content,
+            "role": "tool",
+            "tool_call_id": msg.get("tool_call_id", ""),
+            "content": content,
         }]
 
     return []

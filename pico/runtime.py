@@ -1077,6 +1077,9 @@ class Pico:
         after_snapshot = before_snapshot
         try:
             result = clip(tool["run"](args))
+            if "[truncated" in result:
+                result += f"\n# Previous call: {name} {json.dumps(args)}"
+                result += f"\n# Hint: Large output was truncated. Try reducing range (e.g., end-start < 100)."
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
@@ -1128,10 +1131,10 @@ class Pico:
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
         # 这里提前挡掉最简单的这种循环。
         tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
-        if len(tool_events) < 2:
+        if not tool_events:
             return False
-        recent = tool_events[-2:]
-        return all(item["name"] == name and item["args"] == args for item in recent)
+        last = tool_events[-1]
+        return last["name"] == name and last["args"] == args
 
     @staticmethod
     def new_task_id():
