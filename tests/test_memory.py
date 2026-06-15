@@ -1,122 +1,137 @@
-from pico.memory import LayeredMemory
+"""简化版记忆系统的测试。
+
+工作记忆（working、episodic_notes、file_summaries）已由
+MemoryPipeline / SummaryBuffer 管理，LayeredMemory 现在仅管理持久记忆。
+"""
+
+import pytest
+from pico.memory import (
+    LayeredMemory,
+    DurableMemoryStore,
+    default_memory_state,
+    render_memory_text,
+    retrieval_candidates,
+    canonicalize_path,
+    file_freshness,
+    _tokenize,
+)
 
 
-def test_working_memory_tracks_summary_and_recent_files():
-    memory = LayeredMemory()
-
-    memory.set_task_summary("Investigate flaky tests")
-    memory.remember_file("README.md")
-    memory.remember_file("src/app.py")
-    memory.remember_file("README.md")
-
-    snapshot = memory.to_dict()
-
-    assert snapshot["working"]["task_summary"] == "Investigate flaky tests"
-    assert snapshot["working"]["recent_files"] == ["src/app.py", "README.md"]
-    assert snapshot["task"] == "Investigate flaky tests"
-    assert snapshot["files"] == ["src/app.py", "README.md"]
+class TestDefaultState:
+    def test_default_memory_state_is_minimal(self):
+        state = default_memory_state()
+        assert "durable_topics" in state
+        assert state["durable_topics"] == []
 
 
-def test_episodic_notes_append_and_retrieve_deterministically():
-    memory = LayeredMemory()
+class TestDurableMemoryStore:
+    def test_empty_store_returns_empty_topics(self, tmp_path):
+        store = DurableMemoryStore(tmp_path / ".pico" / "memory")
+        assert store.topic_slugs() == []
+        assert store.load_index() == []
 
-    memory.append_note("Exact tag note", tags=("recall",), created_at="2026-04-07T10:00:00+00:00")
-    memory.append_note("Keyword overlap note about memory", created_at="2026-04-07T10:01:00+00:00")
-    memory.append_note("Newest unrelated note", created_at="2026-04-07T10:02:00+00:00")
-    memory.append_note("Older unrelated note", created_at="2026-04-07T09:59:00+00:00")
+    def test_promote_and_retrieve(self, tmp_path):
+        store = DurableMemoryStore(tmp_path / ".pico" / "memory")
+        promoted, _ = store.promote([("key-decisions", "Use pytest for testing")])
+        assert "key-decisions: Use pytest for testing" in promoted
+        assert store.topic_slugs() == ["key-decisions"]
 
-    snapshot = memory.to_dict()
-    assert [note["text"] for note in snapshot["episodic_notes"]] == [
-        "Exact tag note",
-        "Keyword overlap note about memory",
-        "Newest unrelated note",
-        "Older unrelated note",
-    ]
-    assert snapshot["notes"] == [
-        "Exact tag note",
-        "Keyword overlap note about memory",
-        "Newest unrelated note",
-        "Older unrelated note",
-    ]
+        candidates = store.retrieval_candidates("pytest testing", limit=3)
+        assert len(candidates) >= 1
 
-    lines = [line for line in memory.retrieval_view("recall memory", limit=4).splitlines() if line.startswith("- ")]
-    assert lines == [
-        "- Exact tag note",
-        "- Keyword overlap note about memory",
-    ]
+    def test_promote_deduplicates(self, tmp_path):
+        store = DurableMemoryStore(tmp_path / ".pico" / "memory")
+        store.promote([("user-preferences", "Prefers tab indentation")])
+        promoted, superseded = store.promote([("user-preferences", "Prefers tab indentation")])
+        assert promoted == []
+        assert superseded == []
 
-
-def test_file_summaries_use_canonical_paths_and_freshness(tmp_path):
-    file_path = tmp_path / "sample.txt"
-    file_path.write_text("alpha\n", encoding="utf-8")
-    memory = LayeredMemory(workspace_root=tmp_path)
-
-    memory.set_file_summary("./sample.txt", "sample.txt: alpha")
-    memory.remember_file("./sample.txt")
-    snapshot = memory.to_dict()["file_summaries"]["sample.txt"]
-
-    assert snapshot["summary"] == "sample.txt: alpha"
-    assert snapshot["freshness"]
-
-    assert "sample.txt: alpha" in memory.render_memory_text()
-    file_path.write_text("beta\n", encoding="utf-8")
-    assert "sample.txt: alpha" not in memory.render_memory_text()
-
-    memory.invalidate_file_summary("sample.txt")
-
-    assert "sample.txt" not in memory.to_dict()["file_summaries"]
+    def test_subject_key_replacement(self, tmp_path):
+        store = DurableMemoryStore(tmp_path / ".pico" / "memory")
+        # _subject_key 使用 "is" 和 "uses" 等模式匹配
+        store.promote([("user-preferences", "The framework is FastAPI")])
+        promoted, superseded = store.promote([("user-preferences", "The framework is FastAPI and more")])
+        assert len(superseded) >= 1
 
 
-def test_process_notes_keep_kind_and_latest_duplicate_wins():
-    memory = LayeredMemory()
+class TestLayeredMemory:
+    def test_simplified_memory_has_durable_only(self):
+        memory = LayeredMemory()
+        snapshot = memory.to_dict()
+        assert "durable_topics" in snapshot
+        # 旧字段不应出现
+        assert "working" not in snapshot
+        assert "episodic_notes" not in snapshot
+        assert "file_summaries" not in snapshot
+        assert "task" not in snapshot
+        assert "files" not in snapshot
+        assert "notes" not in snapshot
 
-    memory.append_note(
-        "Shell partial success on README.md; inspect diff before retry",
-        tags=("process", "partial_success"),
-        created_at="2026-04-07T10:00:00+00:00",
-        kind="process",
-    )
-    memory.append_note(
-        "Shell partial success on README.md; inspect diff before retry",
-        tags=("process", "partial_success"),
-        created_at="2026-04-07T10:01:00+00:00",
-        kind="process",
-    )
+    def test_render_memory_text(self):
+        memory = LayeredMemory()
+        text = memory.render_memory_text()
+        assert "Memory:" in text
+        assert "durable_topics" in text
 
-    notes = memory.to_dict()["episodic_notes"]
+    def test_promote_durable_works(self, tmp_path):
+        memory = LayeredMemory(workspace_root=tmp_path)
+        promoted, superseded = memory.promote_durable([
+            ("key-decisions", "Use PostgreSQL as primary database")
+        ])
+        assert len(promoted) >= 1
+        snapshot = memory.to_dict()
+        assert "key-decisions" in snapshot["durable_topics"]
 
-    assert len(notes) == 1
-    assert notes[0]["kind"] == "process"
-    assert notes[0]["created_at"] == "2026-04-07T10:01:00+00:00"
+    def test_retrieval_from_durable(self, tmp_path):
+        memory = LayeredMemory(workspace_root=tmp_path)
+        memory.promote_durable([("key-decisions", "Use async/await for all I/O")])
+        candidates = memory.retrieval_candidates("async await I/O", limit=3)
+        assert len(candidates) >= 1
+
+    def test_retrieval_view(self, tmp_path):
+        memory = LayeredMemory(workspace_root=tmp_path)
+        memory.promote_durable([("user-preferences", "CI uses GitHub Actions on push")])
+        view = memory.retrieval_view("GitHub Actions CI")
+        assert "GitHub Actions" in view
 
 
-def test_durable_memory_index_and_topic_notes_are_loaded_and_retrieved(tmp_path):
-    memory_root = tmp_path / ".pico" / "memory"
-    topics_dir = memory_root / "topics"
-    topics_dir.mkdir(parents=True)
-    (memory_root / "MEMORY.md").write_text(
-        "# Durable Memory Index\n\n"
-        "- [project-conventions](topics/project-conventions.md): Project Conventions\n"
-        "  - summary: Stable repository conventions.\n"
-        "  - tags: convention\n",
-        encoding="utf-8",
-    )
-    (topics_dir / "project-conventions.md").write_text(
-        "# Project Conventions\n\n"
-        "- topic: project-conventions\n"
-        "- summary: Stable repository conventions.\n"
-        "- tags: convention\n"
-        "- updated_at: 2026-04-12T08:14:49+00:00\n\n"
-        "## Notes\n"
-        "- Use constrained tools instead of guessing.\n"
-        "- Preserve local agent state under .pico/.\n",
-        encoding="utf-8",
-    )
+class TestRenderMemoryText:
+    def test_renders_empty_state(self):
+        state = default_memory_state()
+        text = render_memory_text(state)
+        assert "durable_topics: -" in text
 
-    memory = LayeredMemory(workspace_root=tmp_path)
+    def test_renders_with_topics(self):
+        state = {"durable_topics": ["key-decisions", "user-preferences"]}
+        text = render_memory_text(state)
+        assert "key-decisions" in text
+        assert "user-preferences" in text
 
-    snapshot = memory.to_dict()
-    assert snapshot["durable_topics"] == ["project-conventions"]
+    def test_handles_invalid_state(self):
+        assert "invalid state" in render_memory_text(123)
 
-    lines = [line for line in memory.retrieval_view("constrained tools", limit=4).splitlines() if line.startswith("- ")]
-    assert any("Use constrained tools instead of guessing." in line for line in lines)
+
+class TestUtilityFunctions:
+    def test_canonicalize_path(self, tmp_path):
+        file_path = tmp_path / "src" / "app.py"
+        file_path.parent.mkdir(exist_ok=True)
+        file_path.write_text("print('hello')")
+        result = canonicalize_path(file_path, tmp_path)
+        assert result == "src/app.py"
+
+    def test_file_freshness(self, tmp_path):
+        file_path = tmp_path / "test.txt"
+        file_path.write_text("hello")
+        f1 = file_freshness(file_path, tmp_path)
+        file_path.write_text("world")
+        f2 = file_freshness(file_path, tmp_path)
+        assert f1 is not None
+        assert f2 is not None
+        assert f1 != f2
+
+    def test_tokenize(self):
+        tokens = _tokenize("Hello World 42 test_abc")
+        assert "hello" in tokens
+        assert "world" in tokens
+        assert "42" in tokens
+        assert "test_abc" in tokens

@@ -21,6 +21,7 @@ from .run_store import RunStore
 from .task_state import TaskState
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
+from .memory_pipeline import MemoryPipeline
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
 REDACTED_VALUE = "<redacted>"
@@ -142,6 +143,8 @@ class Pico:
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
         self.context_manager = ContextManager(self)
+        self.memory_pipeline = MemoryPipeline(self)
+        self.memory_pipeline.start_idle_watcher()
         self.resume_state = self.evaluate_resume_state()
         self.session_path = self.session_store.save(self.session)
         self.current_task_state = None
@@ -211,9 +214,10 @@ class Pico:
         return state.get("items", {}).get(checkpoint_id)
 
     def invalidate_stale_memory(self):
-        invalidated = self.memory.invalidate_stale_file_summaries()
+        # 文件摘要已由 MemoryPipeline 管理，此处返回空列表保持 API 兼容
+        self.memory.to_dict()
         self.session["memory"] = self.memory.to_dict()
-        return invalidated
+        return []
 
     def evaluate_resume_state(self):
         previous_resume_state = dict(self.session.get("resume_state", {}) or {})
@@ -330,6 +334,7 @@ class Pico:
     def build_prefix(self):
         # 系统提示词：告诉模型它是谁、规则是什么、当前仓库状态。
         # 工具定义通过 API 原生 function calling 传递，不写在这里。
+        session_id = self.session.get("id", "")
         text = textwrap.dedent(
             f"""\
             You are pico, a small local coding agent working inside a local repository.
@@ -344,6 +349,7 @@ class Pico:
             - New files should be complete and runnable, including obvious imports.
             - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
             - Required tool arguments must not be empty.
+            - When the conversation history summary (marked with [对话历史摘要]) contains insufficient information, you can use read_file to read .pico/sessions/{session_id}.json and check the source_range index range for original tool call records.
 
             {self.workspace.text()}
             """
@@ -577,7 +583,14 @@ class Pico:
         checkpoint_id = "ckpt_" + uuid.uuid4().hex[:8]
         key_files = []
         freshness = {}
-        for path in self.memory.to_dict()["working"]["recent_files"]:
+        # recent_files 已由 history 中的工具调用记录隐式追踪
+        recent_file_paths = set()
+        for item in self.session.get("history", [])[-20:]:
+            if item.get("role") == "tool":
+                p = item.get("args", {}).get("path")
+                if p:
+                    recent_file_paths.add(p)
+        for path in list(recent_file_paths)[-8:]:
             file_freshness = memorylib.file_freshness(path, self.root)
             freshness[path] = file_freshness
             key_files.append({"path": path, "freshness": file_freshness})
@@ -613,57 +626,27 @@ class Pico:
         return "Continue the task from the latest checkpoint."
 
     def update_memory_after_tool(self, name, args, result):
-        """把少量高价值工具结果沉淀到 working memory。
+        """工具调用后的轻量清理。
 
-        为什么存在：
-        并不是每个工具结果都值得长期带进下一轮 prompt。完整结果已经进了
-        `history`，这里只挑少量"下一轮大概率还会用到"的事实做提纯，
-        例如最近读写过哪些文件、某个文件读出来的短摘要。
-
-        输入 / 输出：
-        - 输入：工具名 `name`、参数 `args`、执行结果 `result`
-        - 输出：无显式返回值，副作用是更新 `self.memory`
-
-        在 agent 链路里的位置：
-        它发生在 `run_tool()` 真正执行完工具之后、下一轮 prompt 组装之前。
-        也就是说：工具结果先进入完整历史，再由这个函数择优沉淀成轻量记忆。
+        为什么简化：
+        文件摘要和情景笔记已由 MemoryPipeline / SummaryBuffer 管理。
+        此方法现在只保留向后兼容的空壳，主逻辑在 pipeline.notify_agent_response() 中。
         """
         if not self.feature_enabled("memory"):
             return
-        path = args.get("path")
-        if not path:
-            return
-
-        canonical_path = self.memory.canonical_path(path)
-        # 不是所有工具结果都进入工作记忆。
-        # 读文件会生成摘要；写文件/patch 会让旧摘要失效，因为它们可能过期了。
-        if name in {"read_file", "write_file", "patch_file"}:
-            self.memory.remember_file(canonical_path)
-        if name == "read_file":
-            summary = memorylib.summarize_read_result(result)
-            self.memory.set_file_summary(canonical_path, summary)
-            self.memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
-        elif name in {"write_file", "patch_file"}:
-            self.memory.invalidate_file_summary(canonical_path)
 
     def note_tool(self, name, args, result):
         self.update_memory_after_tool(name, args, result)
 
     def record_process_note_for_tool(self, name, metadata):
-        status = str(metadata.get("tool_status", "")).strip()
-        if status not in {"partial_success", "error", "rejected"}:
-            return
-        affected_paths = [str(path).strip() for path in metadata.get("affected_paths", []) if str(path).strip()]
-        path_text = ", ".join(affected_paths) or "workspace"
-        if status == "partial_success":
-            text = f"{name} partial_success on {path_text}; inspect diff before retry"
-        elif status == "error":
-            text = f"{name} error on {path_text}; check the failure before retry"
-        else:
-            text = f"{name} rejected; choose a different action before retry"
-        tags = ["process", status, *affected_paths]
-        self.memory.append_note(text, tags=tuple(tags), source=name, kind="process")
-        self.session["memory"] = self.memory.to_dict()
+        """记录工具调用的进程状态笔记（简化版）。
+
+        笔记不再写入 LayeredMemory（已被摘要缓冲区替代），
+        仅保留工具状态元数据供 trace 使用。
+        """
+        # 工具状态信息已通过 _last_tool_result_metadata 传递到 trace
+        # 此方法保留签名以维持 API 兼容性
+        pass
 
     def reject_durable_reason(self, note_text):
         text = str(note_text or "").strip()
@@ -747,7 +730,7 @@ class Pico:
         这里就是最关键的入口。
         """
         run_started_at = time.monotonic()
-        self.memory.set_task_summary(user_message)
+        # 任务摘要已由 MemoryPipeline 的累计摘要机制管理
         self.record({"role": "user", "content": user_message, "created_at": now()})
 
         task_state = TaskState.create(run_id=self.new_run_id(), task_id=self.new_task_id(), user_request=user_message)
@@ -857,6 +840,10 @@ class Pico:
                 # 把后端返回的 usage/cache 统计并回 prompt_metadata，
                 # 方便统一写入 report 和 trace。
                 prompt_metadata.update(completion_metadata)
+                # 用真实 token 数校准 ContextManager 的估算比例
+                actual_input = completion_metadata.get("input_tokens")
+                if actual_input and actual_input > 0:
+                    self.context_manager.calibrate_ratio(actual_input, len(system) + sum(len(msg.get("content", "")) for msg in messages))
             self.last_completion_metadata = completion_metadata
             self.last_prompt_metadata = prompt_metadata
             tool_use = completion_metadata.get("tool_use")
@@ -885,7 +872,10 @@ class Pico:
                 print(f"[Tool] {name}({json.dumps(args, ensure_ascii=False)})")
                 task_state.record_tool(name)
                 tool_started_at = time.monotonic()
+                # 记录本次工具调用在 history 中的起始索引
+                hist_start = len(self.session["history"])
                 result = self.run_tool(name, args)
+                self.memory_pipeline.notify_tool_executed()
                 self.record(
                     {
                         "role": "assistant",
@@ -904,6 +894,9 @@ class Pico:
                         "created_at": now(),
                     }
                 )
+                # 提取 agent 对工具调用结果的分析作为摘要（零成本）
+                hist_end = len(self.session["history"]) - 1
+                self.memory_pipeline.notify_agent_response(raw, hist_start, hist_end)
                 self.run_store.write_task_state(task_state)
                 self.emit_trace(
                     task_state,
@@ -926,6 +919,16 @@ class Pico:
                         "trigger": "tool_executed",
                     },
                 )
+                # 检查是否需要触发上下文压缩
+                estimated_tokens = self.context_manager._estimate_tokens(
+                    self.context_manager._assemble_prompt(
+                        self.context_manager._render_sections_without_reduction(
+                            {"prefix": str(getattr(self, "prefix", "")), "memory": str(self.memory_text()), "history": "", "current_request": f"Current user request:\n{user_message}"},
+                            selected_notes=[],
+                        )
+                    )
+                )
+                self.memory_pipeline.check_and_compress(estimated_tokens, self.context_manager.total_budget)
                 continue
 
             if kind == "retry":
@@ -962,6 +965,8 @@ class Pico:
                 },
             )
             self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+            # 持久化累计摘要
+            self.memory_pipeline.save_records(self.session["id"])
             return final
 
         if attempts >= max_attempts and tool_steps < self.max_steps:
@@ -993,6 +998,8 @@ class Pico:
             },
         )
         self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+        # 持久化累计摘要
+        self.memory_pipeline.save_records(self.session["id"])
         return final
 
     def run_tool(self, name, args):
@@ -1214,6 +1221,13 @@ class Pico:
         self.session["memory"].clear()
         self.session["memory"].update(memorylib.default_memory_state())
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
+        # 重置 pipeline 状态
+        if hasattr(self, "memory_pipeline"):
+            self.memory_pipeline.buffer.clear()
+            self.memory_pipeline.cumulative_summary = None
+            self.memory_pipeline.cumulative_source_range = None
+            self.memory_pipeline.last_compression_history_index = -1
+            self.memory_pipeline._rounds_since_last_compression = 0
         self.session_store.save(self.session)
 
     def path(self, raw_path):

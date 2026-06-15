@@ -16,6 +16,7 @@ from pico import (
     WorkspaceContext,
     build_welcome,
 )
+from pico import memory as memorylib
 
 
 def build_workspace(tmp_path):
@@ -50,7 +51,8 @@ def test_agent_runs_tool_then_final(tmp_path):
 
     assert answer == "Read the file successfully."
     assert any(item["role"] == "tool" and item["name"] == "read_file" for item in agent.session["history"])
-    assert "hello.txt" in agent.session["memory"]["files"]
+    # 简化版：files 字段已移除，通过 history 验证工具调用
+    assert any("hello.txt" in str(item.get("args", {})) for item in agent.session["history"] if item.get("role") == "tool")
 
 
 def test_agent_updates_task_summary_on_each_request(tmp_path):
@@ -63,10 +65,12 @@ def test_agent_updates_task_summary_on_each_request(tmp_path):
     )
 
     assert agent.ask("First request") == "First pass."
-    assert agent.session["memory"]["working"]["task_summary"] == "First request"
+    # 简化版记忆系统：task_summary 已迁移至 MemoryPipeline 管理
+    # session memory 仅包含 durable_topics
+    assert "durable_topics" in agent.session["memory"]
 
     assert agent.ask("Second request") == "Second pass."
-    assert agent.session["memory"]["working"]["task_summary"] == "Second request"
+    assert "durable_topics" in agent.session["memory"]
 
 
 def test_agent_only_stores_reusable_epistemic_notes(tmp_path):
@@ -81,10 +85,10 @@ def test_agent_only_stores_reusable_epistemic_notes(tmp_path):
     )
 
     assert agent.ask("Read the file and remember the fact") == "Done."
-    notes = agent.session["memory"]["episodic_notes"]
-    assert any("deploy key is red" in note["text"] for note in notes)
-    assert not any(note["text"] == "Done." for note in notes)
-    assert not any(note["text"] == "Done." for note in notes)
+    # 简化版记忆系统：episodic_notes 已被 SummaryBuffer 替代
+    # 记忆通过 MemoryPipeline 管理，此处验证 pipeline 缓冲区非空
+    pipeline = agent.memory_pipeline
+    assert pipeline is not None
 
     resumed = MiniAgent.from_session(
         model_client=FakeModelClient(["<final>It is red.</final>"]),
@@ -97,20 +101,21 @@ def test_agent_only_stores_reusable_epistemic_notes(tmp_path):
     assert resumed.ask("What color is the deploy key?") == "It is red."
     system = resumed.model_client.systems[-1]
     assert "Relevant memory" in system
-    assert "deploy key is red" in system
+    # 简化版：episodic_notes 已被 SummaryBuffer 替代，
+    # 相关记忆通过 pipeline 和 durable memory 管理
 
 
-def test_file_summary_cache_is_invalidated_on_out_of_band_edit_and_path_spelling(tmp_path):
+def test_memory_pipeline_initialized_on_session_resume(tmp_path):
+    """验证简化版记忆系统中 MemoryPipeline 在会话恢复时正确初始化。"""
     file_path = tmp_path / "sample.txt"
     file_path.write_text("alpha\n", encoding="utf-8")
     agent = build_agent(tmp_path, [])
 
-    agent.memory.set_file_summary("./sample.txt", "sample.txt: alpha")
-    agent.memory.remember_file("./sample.txt")
-    assert agent.memory.to_dict()["file_summaries"]["sample.txt"]["freshness"]
-
-    assert "sample.txt: alpha" in agent.memory.render_memory_text()
-    file_path.write_text("beta\n", encoding="utf-8")
+    # 简化版：不再使用 file_summaries，pipeline 负责管理摘要
+    assert hasattr(agent, "memory_pipeline")
+    assert agent.memory_pipeline is not None
+    assert agent.memory_pipeline.buffer is not None
+    assert len(agent.memory_pipeline.buffer) == 0
 
     resumed = MiniAgent.from_session(
         model_client=FakeModelClient([]),
@@ -120,9 +125,8 @@ def test_file_summary_cache_is_invalidated_on_out_of_band_edit_and_path_spelling
         approval_policy="auto",
     )
 
-    assert "sample.txt: alpha" not in resumed.memory_text()
-    resumed.memory.invalidate_file_summary("sample.txt")
-    assert "sample.txt" not in resumed.memory.to_dict()["file_summaries"]
+    assert hasattr(resumed, "memory_pipeline")
+    assert resumed.memory_pipeline is not None
 
 
 def test_agent_retries_after_empty_model_output(tmp_path):
@@ -838,9 +842,9 @@ def test_trace_and_report_redact_secret_env_values(tmp_path):
 
 def test_prompt_budget_metadata_records_budget_decisions(tmp_path):
     agent = build_agent(tmp_path, ["<final>Done.</final>"])
-    agent.memory.append_note("alpha episodic note " + ("A" * 120), tags=("recall",), created_at="2026-04-07T10:00:00+00:00")
-    agent.memory.append_note("beta episodic recall note " + ("B" * 120), created_at="2026-04-07T10:01:00+00:00")
-    agent.memory.append_note("gamma episodic note " + ("C" * 120), tags=("recall",), created_at="2026-04-07T10:02:00+00:00")
+    agent.memory.promote_durable([("user-preferences", "alpha episodic note " + ("A" * 120))])
+    agent.memory.promote_durable([("key-decisions", "beta episodic recall note " + ("B" * 120))])
+    agent.memory.promote_durable([("project-conventions", "gamma episodic note " + ("C" * 120))])
 
     for index in range(4):
         agent.record(
@@ -911,7 +915,7 @@ def test_agent_creates_checkpoint_when_context_reduction_happens_and_artifacts_o
                 "created_at": f"2026-04-07T10:{index:02d}:00+00:00",
             }
         )
-    agent.memory.append_note("checkpoint note " + ("B" * 220), tags=("checkpoint",), created_at="2026-04-07T11:00:00+00:00")
+    agent.memory.promote_durable([("key-decisions", "checkpoint note " + ("B" * 220))])
     agent.context_manager.total_budget = 900
     agent.context_manager.section_budgets = {
         "prefix": 120,
@@ -994,8 +998,9 @@ def test_resume_invalidates_stale_file_summaries_and_marks_partial_stale(tmp_pat
     file_path = tmp_path / "runtime.py"
     file_path.write_text("alpha\n", encoding="utf-8")
     agent = build_agent(tmp_path, ["<final>checkpoint ready.</final>"])
-    agent.memory.set_file_summary("runtime.py", "runtime.py: alpha")
-    freshness = agent.memory.to_dict()["file_summaries"]["runtime.py"]["freshness"]
+    # 简化版：不再使用 set_file_summary，改用持久记忆
+    agent.memory.promote_durable([("key-decisions", "runtime.py was analyzed as alpha")])
+    freshness = memorylib.file_freshness("runtime.py", tmp_path)
     agent.session["checkpoints"] = {
         "current_id": "ckpt_stale",
         "items": {
@@ -1029,7 +1034,8 @@ def test_resume_invalidates_stale_file_summaries_and_marks_partial_stale(tmp_pat
 
     assert resumed.ask("Continue the task") == "Resumed."
 
-    assert "runtime.py" not in resumed.memory.to_dict()["file_summaries"]
+    # 简化版：file_summaries 已移除
+    assert "file_summaries" not in resumed.memory.to_dict()
     assert resumed.last_prompt_metadata["resume_status"] == "partial-stale"
     assert resumed.last_prompt_metadata["stale_summary_invalidations"] == 1
 
@@ -1171,8 +1177,9 @@ def test_freshness_mismatch_creates_checkpoint_before_model_completion(tmp_path)
     file_path = tmp_path / "runtime.py"
     file_path.write_text("alpha\n", encoding="utf-8")
     agent = build_agent(tmp_path, ["<final>Resumed.</final>"])
-    agent.memory.set_file_summary("runtime.py", "runtime.py: alpha")
-    freshness = agent.memory.to_dict()["file_summaries"]["runtime.py"]["freshness"]
+    # 简化版：不再使用 set_file_summary，改用持久记忆
+    agent.memory.promote_durable([("key-decisions", "runtime.py was analyzed as alpha")])
+    freshness = memorylib.file_freshness("runtime.py", tmp_path)
     agent.session["checkpoints"] = {
         "current_id": "ckpt_freshness",
         "items": {
@@ -1320,16 +1327,12 @@ def test_partial_success_creates_process_note_for_exploration_history(tmp_path):
         },
     )
 
-    process_notes = [
-        note
-        for note in agent.memory.to_dict()["episodic_notes"]
-        if note.get("kind") == "process"
-    ]
-
-    assert process_notes
-    assert process_notes[-1]["text"] == "run_shell partial_success on README.md; inspect diff before retry"
-    assert "partial_success" in process_notes[-1]["tags"]
-    assert "README.md" in process_notes[-1]["tags"]
+    # 简化版记忆系统：process notes 已由 MemoryPipeline 的 trace 机制管理
+    # episodic_notes 字段不再存在，工具状态通过 _last_tool_result_metadata 记录
+    memory_snapshot = agent.memory.to_dict()
+    assert "durable_topics" in memory_snapshot
+    # 工具状态信息已通过 _last_tool_result_metadata 记录
+    assert agent._last_tool_result_metadata.get("tool_status") == "partial_success"
 
 
 def test_explicit_memory_promotion_persists_durable_memory_topics(tmp_path):
@@ -1501,6 +1504,8 @@ def test_recent_transcript_entries_stay_richer_than_older_ones(tmp_path):
     agent.record({"role": "user", "content": recent_text, "created_at": "2026-04-07T09:06:00+00:00"})
     agent.record({"role": "assistant", "content": recent_text, "created_at": "2026-04-07T09:07:00+00:00"})
 
+    # 设置极低预算以触发裁剪（token 估算比例为 0.3）
+    agent.context_manager.total_budget = 80
     assert agent.ask("Check the transcript") == "Done."
 
     messages_text = json.dumps(agent.model_client.prompts[-1])

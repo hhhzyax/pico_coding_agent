@@ -201,11 +201,9 @@ def build_stress_agent_metrics():
             approval_policy="auto",
         )
         for index in range(12):
-            agent.memory.append_note(
-                f"stress-note-{index}-" + ("A" * 180),
-                tags=("recall",),
-                created_at=f"2026-04-08T10:{index:02d}:00+00:00",
-            )
+            agent.memory.promote_durable([
+                ("user-preferences", f"stress-note-{index}-" + ("A" * 180))
+            ])
             agent.record(
                 {
                     "role": "user" if index % 2 == 0 else "assistant",
@@ -459,11 +457,9 @@ def run_context_stress_matrix(repetitions=5):
                             approval_policy="auto",
                         )
                         for index in range(note_count):
-                            agent.memory.append_note(
-                                f"matrix-note-{index}-" + ("A" * 180),
-                                tags=("recall",),
-                                created_at=f"2026-04-08T10:{index:02d}:00+00:00",
-                            )
+                            agent.memory.promote_durable([
+                                ("user-preferences", f"matrix-note-{index}-" + ("A" * 180))
+                            ])
                         for index in range(history_count):
                             agent.record(
                                 {
@@ -920,7 +916,7 @@ def run_real_context_experiment(provider="gpt", repetitions=1):
                             agent = _build_real_agent(workspace_root, provider)
                             for index in range(note_count):
                                 note_text = f"target token is {token}" if index == 0 else f"decoy token is DECOY-{index}"
-                                agent.memory.append_note(note_text, tags=("token",), created_at=f"2026-04-09T10:{index:02d}:00+00:00")
+                                agent.memory.promote_durable([("user-preferences", note_text)])
                             for index in range(history_count):
                                 agent.record(
                                     {

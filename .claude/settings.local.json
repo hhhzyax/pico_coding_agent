@@ -19,7 +19,23 @@
       "Bash(git stash *)",
       "Bash(python -m pytest tests/test_pico.py::test_recent_transcript_entries_stay_richer_than_older_ones -x -v)",
       "Bash(python -m pytest tests/test_pico.py -x -v -k \"openai or sse or prompt_cache\")",
-      "Bash(python -m pytest tests/test_pico.py -v -k \"not test_recent_transcript_entries_stay_richer_than_older_ones\")"
+      "Bash(python -m pytest tests/test_pico.py -v -k \"not test_recent_transcript_entries_stay_richer_than_older_ones\")",
+      "Bash(mkdir -p spec/changes/simplify-memory-system/specs/memory-pipeline && echo \"created\" && ls -la spec/changes/simplify-memory-system/ 2>/dev/null)",
+      "Bash(python -c \"from pico.summary_buffer import SummaryBuffer, SummaryEntry; print\\('summary_buffer OK'\\); from pico.memory_pipeline import MemoryPipeline, PipelineConfig; print\\('memory_pipeline OK'\\); from pico.summary_compressor import compress, build_compression_prompt; print\\('summary_compressor OK'\\); from pico import memory; print\\('memory OK'\\); from pico.context_manager import ContextManager; print\\('context_manager OK'\\)\")",
+      "Bash(python -m pytest tests/ -x -v --timeout=30)",
+      "Bash(python -m pytest tests/ -x -v)",
+      "Bash(python -m pytest tests/test_memory.py tests/test_context_manager.py tests/test_summary_buffer.py -x -v)",
+      "Bash(python -m pytest tests/test_memory.py tests/test_context_manager.py tests/test_summary_buffer.py tests/test_summary_compressor.py -x -v)",
+      "Bash(python -m pytest tests/test_memory.py tests/test_context_manager.py tests/test_summary_buffer.py tests/test_summary_compressor.py -v)",
+      "Bash(python -m pytest tests/test_summary_buffer.py::TestMemoryPipelineSummaryExtraction::test_extract_summary_skips_tool_tags -v)",
+      "Bash(python -m pytest tests/test_summary_buffer.py tests/test_memory.py tests/test_context_manager.py tests/test_summary_compressor.py -v)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python -m pytest tests/ -v --ignore=tests/test_evaluator.py --ignore=tests/test_metrics.py)",
+      "Bash(python -m pytest tests/test_pico.py tests/test_context_manager.py tests/test_memory.py tests/test_summary_buffer.py tests/test_summary_compressor.py tests/test_task_state.py tests/test_run_store.py tests/test_safety_invariants.py -v)",
+      "Bash(python -m pytest tests/test_pico.py::test_agent_only_stores_reusable_epistemic_notes -v)"
+    ],
+    "additionalDirectories": [
+      "D:\\code\\pico\\spec\\changes\\simplify-memory-system\\specs"
     ]
   }
 }

@@ -469,8 +469,9 @@ class BenchmarkEvaluator:
         initial_history_empty = len(agent.session["history"]) == 0
         initial_memory_state = agent.memory.to_dict()
         initial_memory_empty = memorylib.is_effectively_empty(initial_memory_state)
-        initial_task_summary_empty = not str(initial_memory_state["working"]["task_summary"]).strip()
-        initial_episodic_notes_empty = not initial_memory_state["episodic_notes"]
+        # 简化版记忆系统不再使用 working / episodic_notes 字段
+        initial_task_summary_empty = True  # task_summary 由 MemoryPipeline 管理
+        initial_episodic_notes_empty = True  # episodic_notes 已被 SummaryBuffer 替代
 
         final_answer = agent.ask(task["prompt"])
         task_state = agent.current_task_state

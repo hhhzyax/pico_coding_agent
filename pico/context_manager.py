@@ -74,6 +74,48 @@ class ContextManager:
         self._section_floor_overrides = {str(key): int(value) for key, value in (section_floors or {}).items()}
         self.section_floors = self._compute_section_floors()
         self.reduction_order = tuple(reduction_order or DEFAULT_REDUCTION_ORDER)
+        # Token 估算：用字符数 × 动态校准比例
+        self._token_per_char_ratio: float = 0.3
+        self._estimated_input_tokens: int = 0
+
+    def _estimate_tokens(self, text: str) -> int:
+        """快速 token 估算，用字符数 × 经验比例。
+
+        初始比例 0.3（英文 ~0.25，中文 ~0.6，取保守值）。
+        每次 API 返回真实 usage 后自动校准。
+        """
+        return int(len(text) * self._token_per_char_ratio)
+
+    def _get_cumulative_summary_text(self) -> str | None:
+        """获取 MemoryPipeline 的累计摘要（如果存在）。"""
+        pipeline = getattr(self.agent, "memory_pipeline", None)
+        if pipeline is None:
+            return None
+        summary = pipeline.cumulative_summary
+        if not summary:
+            return None
+        # 附带溯源区间信息
+        source_range = pipeline.cumulative_source_range
+        session_id = self.agent.session.get("id", "")
+        if source_range and session_id:
+            hint = (
+                f"当上述摘要中的信息不足以判断时，你可以使用 read_file 工具"
+                f"读取 .pico/sessions/{session_id}.json，"
+                f"查看 source_range {list(source_range)} 的原始记录。"
+            )
+            return f"{summary}\n\n{hint}"
+        return summary
+
+    def calibrate_ratio(self, actual_input_tokens: int, prompt_chars: int):
+        """用 API 返回的真实 token 数校准估算比例。
+
+        使用指数移动平均，平滑波动。
+        """
+        if prompt_chars > 0 and actual_input_tokens > 0:
+            observed = actual_input_tokens / prompt_chars
+            self._token_per_char_ratio = (
+                0.7 * self._token_per_char_ratio + 0.3 * observed
+            )
 
     def build(self, user_message):
         """按预算组装一轮完整 prompt，返回原生 function calling 格式。
@@ -117,8 +159,9 @@ class ContextManager:
         prompt = self._assemble_prompt(rendered)
         reduction_log = []
 
-        while len(prompt) > self.total_budget:
-            overflow = len(prompt) - self.total_budget
+        estimated_tokens = self._estimate_tokens(prompt)
+        while estimated_tokens > self.total_budget:
+            overflow = max(1, int((estimated_tokens - self.total_budget) / self._token_per_char_ratio))
             reduced = False
             for section in self.reduction_order:
                 floor = int(self.section_floors.get(section, 0))
@@ -143,10 +186,11 @@ class ContextManager:
                 break
             if not reduced:
                 break
+            estimated_tokens = self._estimate_tokens(prompt)
 
-        return self._build_native_result(prompt, rendered, user_message, section_texts, budgets=budgets, reduction_log=reduction_log, selected_notes=selected_notes)
+        return self._build_native_result(prompt, rendered, user_message, section_texts, budgets=budgets, reduction_log=reduction_log, selected_notes=selected_notes, estimated_tokens=estimated_tokens)
 
-    def _build_native_result(self, prompt, rendered, user_message, section_texts, budgets, reduction_log, selected_notes):
+    def _build_native_result(self, prompt, rendered, user_message, section_texts, budgets, reduction_log, selected_notes, estimated_tokens=0):
         metadata = self._metadata(
             prompt=prompt,
             rendered=rendered,
@@ -155,6 +199,7 @@ class ContextManager:
             selected_notes=selected_notes,
             user_message=user_message,
             section_texts=section_texts,
+            estimated_tokens=estimated_tokens,
         )
         system = "\n\n".join(
             rendered[sec].rendered
@@ -168,9 +213,25 @@ class ContextManager:
 
     def _history_to_native_messages(self, history_budget=None):
         history = self.agent.session.get("history", [])
+        # 注入累计摘要（如果存在）
+        cumulative_summary = self._get_cumulative_summary_text()
         recent_count = 12
         recent_start = max(0, len(history) - recent_count)
+        # 如果有累计摘要，被覆盖的历史条目不再进入上下文
+        pipeline = getattr(self.agent, "memory_pipeline", None)
+        if pipeline and pipeline.cumulative_summary and pipeline.last_compression_history_index >= 0:
+            compression_idx = pipeline.last_compression_history_index
+            # 保留区：压缩点之后 + 最近 25% 的条目
+            retention_start = max(compression_idx + 1, recent_start)
+            # 仅保留 retention_start 之后的条目
+            history = [h for i, h in enumerate(history) if i >= retention_start]
         messages = []
+        # 在消息列表开头注入累计摘要
+        if cumulative_summary:
+            messages.append({
+                "role": "system",
+                "content": f"[对话历史摘要]\n{cumulative_summary}",
+            })
         for index, item in enumerate(history):
             recent = index >= recent_start
             role = item.get("role", "")
@@ -486,7 +547,7 @@ class ContextManager:
             ]
         ).strip()
 
-    def _metadata(self, prompt, rendered, budgets, reduction_log, selected_notes, user_message, section_texts):
+    def _metadata(self, prompt, rendered, budgets, reduction_log, selected_notes, user_message, section_texts, estimated_tokens=0):
         section_metadata = {}
         for section in SECTION_ORDER[:-1]:
             section_metadata[section] = {
@@ -502,7 +563,9 @@ class ContextManager:
         return {
             "prompt_chars": len(prompt),
             "prompt_budget_chars": self.total_budget,
-            "prompt_over_budget": len(prompt) > self.total_budget,
+            "estimated_input_tokens": estimated_tokens,
+            "token_per_char_ratio": round(self._token_per_char_ratio, 4),
+            "prompt_over_budget": estimated_tokens > self.total_budget if estimated_tokens else len(prompt) > self.total_budget,
             "section_order": list(SECTION_ORDER),
             "section_budgets": {
                 section: (None if section == CURRENT_REQUEST_SECTION else int(budgets.get(section, 0)))
